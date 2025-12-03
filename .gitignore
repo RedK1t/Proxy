@@ -1,0 +1,12 @@
+# Bytecode / cache
+__pycache__/
+*.pyc
+
+# Local DB and logs
+proxy_history.db
+proxy_traffic.log
+
+# Editor / OS files
+.vscode/
+.DS_Store
+.venv/

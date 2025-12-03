@@ -1,0 +1,17 @@
+[
+  {
+    "match": "example.com",
+    "replace_header": {
+      "User-Agent": "MyProxyAgent/1.0",
+      "X-Proxy": "Enabled"
+    }
+  },
+  {
+    "match": "/login",
+    "replace_body": "username=admin&password=admin123"
+  },
+  {
+    "match": "api",
+    "replace_url": "https://httpbin.org/get"
+  }
+]
