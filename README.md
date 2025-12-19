@@ -35,3 +35,12 @@ uvicorn gui_api:app --host 0.0.0.0 --port 5050
 ```bash
 mitmproxy -s [rewrite_engine.py](http://_vscodecontentref_/24) -s [proxy_logger.py](http://_vscodecontentref_/25) -s [logging_addon.py](http://_vscodecontentref_/26) -s [intercept_proxy.py](http://_vscodecontentref_/27) -s [intercept_mode.py](http://_vscodecontentref_/28) -s [history_addon.py](http://_vscodecontentref_/29)
 ```
+
+4. Run mitmdumb with your addons:
+```bash
+mitmdump -s intercept_proxy.py -s proxy_logger.py -s intercept_mode.py -p 8080
+```
+
+5. how to run the project 
+1- python3 gui_api.py
+2- mitmdump -s intercept_proxy.py -s proxy_logger.py -s intercept_mode.py -p 8080
