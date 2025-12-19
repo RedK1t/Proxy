@@ -42,5 +42,10 @@ mitmdump -s intercept_proxy.py -s proxy_logger.py -s intercept_mode.py -p 8080
 ```
 
 5. how to run the project 
-1- python3 gui_api.py
-2- mitmdump -s intercept_proxy.py -s proxy_logger.py -s intercept_mode.py -p 8080
+```bash
+python3 gui_api.py
+```
+
+```bash
+mitmdump -s intercept_proxy.py -s proxy_logger.py -s intercept_mode.py -p 8080
+```
