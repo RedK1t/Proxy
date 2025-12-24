@@ -10,3 +10,4 @@ proxy_traffic.log
 .vscode/
 .DS_Store
 .venv/
+venv/
