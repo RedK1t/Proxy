@@ -1,0 +1,7 @@
+#!/home/hanafi/Documents/RedKit/Proxy/venv/bin/python
+import sys
+from mitmproxy.tools.main import mitmdump
+if __name__ == '__main__':
+    if sys.argv[0].endswith('.exe'):
+        sys.argv[0] = sys.argv[0][:-4]
+    sys.exit(mitmdump())
