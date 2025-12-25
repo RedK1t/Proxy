@@ -1,17 +1,16 @@
 [
-  {
-    "match": "example.com",
-    "replace_header": {
-      "User-Agent": "MyProxyAgent/1.0",
-      "X-Proxy": "Enabled"
+    {
+        "match": "example.com",
+        "replace_header": {
+            "X-Custom-Header": "RedKit-Proxy"
+        }
+    },
+    {
+        "match": "api.target.com/old",
+        "replace_url": "https://api.target.com/new"
+    },
+    {
+        "match": "test.com/login",
+        "replace_body": "username=admin&password=hacked"
     }
-  },
-  {
-    "match": "/login",
-    "replace_body": "username=admin&password=admin123"
-  },
-  {
-    "match": "api",
-    "replace_url": "https://httpbin.org/get"
-  }
 ]
