@@ -638,7 +638,7 @@ urlscan==1.0.3
 urwid==2.6.15
 userpath==1.9.1
 uvicorn==0.32.0
-uvloop==0.21.0
+uvloop==0.21.0; platform_system != "Windows"
 validators==0.20.0
 venusian==3.1.0
 vine==5.1.0
