@@ -59,7 +59,7 @@ pip install -r requirements.txt
 
 ### 2. Run the Dashboard API
 ```bash
-python gui_api.py
+python backend.py
 # or
 uvicorn gui_api:app --host 0.0.0.0 --port 5050
 ```
