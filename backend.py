@@ -68,6 +68,7 @@ def init_database():
             modified_url TEXT,
             modified_headers TEXT,
             modified_body TEXT,
+            intercept_response INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -93,6 +94,13 @@ def init_database():
         c.execute("ALTER TABLE intercept_queue ADD COLUMN item_type TEXT DEFAULT 'request'")
         c.execute("ALTER TABLE intercept_queue ADD COLUMN parent_id TEXT")
         print("[DB Migration] Added response interception columns to intercept_queue table")
+    
+    # Migration: Add intercept_response column if it doesn't exist
+    try:
+        c.execute("SELECT intercept_response FROM intercept_queue LIMIT 1")
+    except sqlite3.OperationalError:
+        c.execute("ALTER TABLE intercept_queue ADD COLUMN intercept_response INTEGER DEFAULT 0")
+        print("[DB Migration] Added 'intercept_response' column to intercept_queue table")
     
     # Intercept settings table for IPC
     c.execute("""
@@ -271,6 +279,36 @@ def forward_all_pending_intercepts():
     c.execute("UPDATE intercept_queue SET status = 'forward' WHERE status = 'pending'")
     conn.commit()
     conn.close()
+
+def set_request_intercept_response(req_id, intercept_response):
+    """Mark a request to have its response intercepted"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE intercept_queue SET intercept_response = ? WHERE id = ?", (1 if intercept_response else 0, req_id))
+    conn.commit()
+    conn.close()
+    print(f"[DEBUG] Set intercept_response={intercept_response} for request {req_id}")
+
+def should_intercept_response(req_id):
+    """Check if a request's response should be intercepted"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT intercept_response FROM intercept_queue WHERE id = ?", (req_id,))
+        row = c.fetchone()
+        conn.close()
+        return row and row[0] == 1
+    except:
+        return False
+
+def remove_parent_request(parent_id):
+    """Remove the parent request when response is processed"""
+    if parent_id:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("DELETE FROM intercept_queue WHERE id = ? AND item_type = 'request'", (parent_id,))
+        conn.commit()
+        conn.close()
 
 # Payload Generator
 class PayloadGenerator:
@@ -566,6 +604,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 set_response_intercept_enabled(response_enabled)
                 await manager.send_personal_message({'type': 'response_intercept_status', 'enabled': response_enabled}, websocket)
             
+            elif action == 'mark_for_response_intercept':
+                req_id = data.get('id')
+                set_request_intercept_response(req_id, True)
+                await manager.send_personal_message({'type': 'marked_for_response_intercept', 'id': req_id}, websocket)
+            
+            elif action == 'unmark_for_response_intercept':
+                req_id = data.get('id')
+                set_request_intercept_response(req_id, False)
+                await manager.send_personal_message({'type': 'unmarked_for_response_intercept', 'id': req_id}, websocket)
+            
             elif action == 'forward_request':
                 req_id = data.get('id')
                 modified = data.get('request', {})
@@ -754,6 +802,7 @@ if MITMPROXY_AVAILABLE:
             self.excluded_patterns = [r"/ws"]
             self.stop_processing = False
             self.flow_request_ids = {}  # Map flow to request_id for response interception
+            self.url_method_to_req_id = {}  # Map URL+method to request_id for response matching
             # Start background thread to process intercepted flows
             self.processing_thread = threading.Thread(target=self._process_intercepted_flows, daemon=True)
             self.processing_thread.start()
@@ -775,12 +824,12 @@ if MITMPROXY_AVAILABLE:
                     # Get all pending intercepts from database
                     conn = sqlite3.connect(DB_FILE)
                     c = conn.cursor()
-                    c.execute("SELECT id, status, modified_method, modified_url, modified_headers, modified_body, modified_response_headers, modified_response_body, item_type FROM intercept_queue WHERE status != 'pending'")
+                    c.execute("SELECT id, status, modified_method, modified_url, modified_headers, modified_body, modified_response_headers, modified_response_body, item_type, parent_id FROM intercept_queue WHERE status != 'pending'")
                     rows = c.fetchall()
                     conn.close()
                     
                     for row in rows:
-                        item_id, action, mod_method, mod_url, mod_headers, mod_body, mod_resp_headers, mod_resp_body, item_type = row
+                        item_id, action, mod_method, mod_url, mod_headers, mod_body, mod_resp_headers, mod_resp_body, item_type, parent_id = row
                         
                         # Handle request interception
                         if item_type == 'request' or item_type is None:
@@ -790,6 +839,8 @@ if MITMPROXY_AVAILABLE:
                                 
                                 if action == 'drop':
                                     flow.response = http.Response.make(403, b"Request Dropped by Interceptor")
+                                    # Remove from database since request is dropped
+                                    remove_from_intercept_queue(item_id)
                                 elif action == 'forward':
                                     # Apply any modifications
                                     if mod_method:
@@ -807,13 +858,18 @@ if MITMPROXY_AVAILABLE:
                                             flow.request.headers[k] = v
                                     if mod_body is not None:
                                         flow.request.text = mod_body
+                                    
+                                    # Check if this request should have its response intercepted
+                                    # If so, DON'T remove it from DB yet
+                                    if should_intercept_response(item_id):
+                                        print(f"[DEBUG] Request {item_id} marked for response intercept, keeping in DB")
+                                    else:
+                                        # Remove from database if not intercepting response
+                                        remove_from_intercept_queue(item_id)
                                 
                                 # Resume the flow
                                 if hasattr(flow, 'resume'):
                                     flow.resume()
-                                
-                                # Remove from database
-                                remove_from_intercept_queue(item_id)
                         
                         # Handle response interception
                         elif item_type == 'response':
@@ -843,8 +899,11 @@ if MITMPROXY_AVAILABLE:
                                 if hasattr(flow, 'resume'):
                                     flow.resume()
                                 
-                                # Remove from database
+                                # Remove response from database
                                 remove_from_intercept_queue(item_id)
+                                # Also remove the parent request if it exists
+                                if parent_id:
+                                    remove_parent_request(parent_id)
                     
                     time.sleep(0.1)  # Poll every 100ms
                 except Exception as e:
@@ -863,6 +922,11 @@ if MITMPROXY_AVAILABLE:
             # Generate unique ID
             req_id = str(uuid.uuid4())
             self.flow_request_ids[flow] = req_id
+            
+            # Store URL+method mapping for response matching
+            url_method_key = f"{flow.request.method}:{flow.request.url}"
+            self.url_method_to_req_id[url_method_key] = req_id
+            print(f"[DEBUG] Intercepted request {req_id} for {url_method_key}")
             
             # Build raw request
             raw_request = f"{flow.request.method} {flow.request.path} HTTP/1.1\n"
@@ -891,11 +955,44 @@ if MITMPROXY_AVAILABLE:
             flow.intercept()  # This pauses the flow without blocking mitmproxy
         
         def response(self, flow):
-            # First, check if we need to intercept the response
-            if is_response_intercept_enabled() and self.should_intercept(flow):
-                # Get the request ID for this flow (if it was intercepted as a request)
-                req_id = self.flow_request_ids.pop(flow, None)
-                
+            # Try to find the request ID by matching URL and method
+            req_id = None
+            url_method_key = f"{flow.request.method}:{flow.request.url}"
+            
+            # First try the flow_request_ids dict (if flow object is same)
+            req_id = self.flow_request_ids.get(flow)
+            if req_id:
+                print(f"[DEBUG] Found req_id {req_id} from flow_request_ids")
+            
+            # If not found, try the URL+method mapping
+            if not req_id:
+                req_id = self.url_method_to_req_id.get(url_method_key)
+                if req_id:
+                    print(f"[DEBUG] Found req_id {req_id} from url_method_to_req_id")
+            
+            # Clean up the mapping once we have the req_id
+            if req_id and url_method_key in self.url_method_to_req_id:
+                del self.url_method_to_req_id[url_method_key]
+            
+            should_intercept = False
+            
+            if req_id:
+                # Check if this specific request was marked for response interception
+                if should_intercept_response(req_id):
+                    print(f"[DEBUG] Request {req_id} is marked for response interception")
+                    should_intercept = True
+                else:
+                    print(f"[DEBUG] Request {req_id} is NOT marked for response interception")
+            else:
+                print(f"[DEBUG] No req_id found for {url_method_key}")
+            
+            # Also check global response intercept toggle
+            if not should_intercept and is_response_intercept_enabled() and self.should_intercept(flow):
+                print(f"[DEBUG] Global response intercept is ON")
+                should_intercept = True
+            
+            if should_intercept:
+                print(f"[DEBUG] Intercepting response for {url_method_key}")
                 # Generate a unique response ID
                 resp_id = str(uuid.uuid4())
                 

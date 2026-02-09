@@ -119,12 +119,12 @@
                     <button onclick="toggleIntercept()" id="intercept-toggle-btn" class="btn-action btn-intercept-toggle">
                         Intercept is OFF
                     </button>
-                    <button onclick="toggleResponseIntercept()" id="response-intercept-toggle-btn" class="btn-action btn-intercept-toggle">
-                        Response Intercept is OFF
-                    </button>
                     <span id="intercept-status" class="text-sm text-gray-400 ml-2"></span>
                 </div>
                 <div class="flex gap-2">
+                    <button onclick="markForResponseIntercept()" id="intercept-response-btn" class="btn-action btn-intercept-toggle" style="background-color: #8b5cf6;" disabled>
+                        Intercept Response
+                    </button>
                     <button onclick="forwardRequest()" class="btn-action btn-forward">Forward</button>
                     <button onclick="dropRequest()" class="btn-action btn-drop">Drop</button>
                     <button onclick="forwardAll()" class="btn-action btn-forward-all">Forward All</button>
@@ -133,6 +133,7 @@
             </div>
             <div class="mt-2 text-xs text-gray-500">
                 Queue: <span id="queue-size">0</span> requests waiting
+                <span id="response-intercept-status" class="ml-4 text-purple-400"></span>
             </div>
         </div>
 
@@ -156,20 +157,46 @@
                 </table>
             </div>
 
-            <!-- Bottom: Request Editor (Plain text like Burp) -->
-            <div class="bottom-pane p-4 border-t border-gray-700">
-                <div class="flex justify-between items-center mb-2">
-                    <h3 class="text-sm font-semibold text-gray-400">Request Editor (Raw)</h3>
-                    <button onclick="updateInterceptedRequest()" class="px-3 py-1 bg-blue-600 rounded hover:bg-blue-500 text-xs">Update Request</button>
-                </div>
-                <textarea id="intercept-editor" class="w-full flex-1 p-3 rounded bg-[#1f1f1f] text-sm font-mono" 
-                    placeholder="GET /path HTTP/1.1
+            <!-- Bottom: Request/Response Editor (Split view like Burp) -->
+            <div class="bottom-pane border-t border-gray-700">
+                <!-- Single pane view (for editing request or response only) -->
+                <div id="single-editor-pane" class="p-4 h-full flex flex-col">
+                    <div class="flex justify-between items-center mb-2">
+                        <h3 id="single-editor-title" class="text-sm font-semibold text-gray-400">Request Editor (Raw)</h3>
+                        <button onclick="updateInterceptedRequest()" class="px-3 py-1 bg-blue-600 rounded hover:bg-blue-500 text-xs">Update</button>
+                    </div>
+                    <textarea id="intercept-editor" class="w-full flex-1 p-3 rounded bg-[#1f1f1f] text-sm font-mono"
+                        placeholder="GET /path HTTP/1.1
 Host: example.com
 User-Agent: Mozilla/5.0
 Content-Type: application/x-www-form-urlencoded
 Content-Length: 13
 
 key=value"></textarea>
+                </div>
+
+                <!-- Split pane view (for response interception - request read-only, response editable) -->
+                <div id="split-editor-pane" class="hidden h-full flex">
+                    <!-- Left: Request (Read-only) -->
+                    <div class="w-1/2 p-4 border-r border-gray-700 flex flex-col">
+                        <div class="flex justify-between items-center mb-2">
+                            <h3 class="text-sm font-semibold text-gray-400">Request (Read-Only)</h3>
+                        </div>
+                        <textarea id="intercept-request-view" class="w-full flex-1 p-3 rounded bg-[#1a1a1a] text-sm font-mono text-gray-400" readonly></textarea>
+                    </div>
+                    <!-- Right: Response (Editable) -->
+                    <div class="w-1/2 p-4 flex flex-col">
+                        <div class="flex justify-between items-center mb-2">
+                            <h3 class="text-sm font-semibold text-gray-400">Response (Editable)</h3>
+                            <button onclick="updateInterceptedResponse()" class="px-3 py-1 bg-blue-600 rounded hover:bg-blue-500 text-xs">Update Response</button>
+                        </div>
+                        <textarea id="intercept-response-editor" class="w-full flex-1 p-3 rounded bg-[#1f1f1f] text-sm font-mono"
+                            placeholder="HTTP/1.1 200 OK
+Content-Type: text/html
+
+Response body..."></textarea>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -361,6 +388,7 @@ let interceptEnabled = false;
 let responseInterceptEnabled = false;
 let interceptQueue = [];
 let selectedInterceptIndex = -1;
+let markedForResponseIntercept = new Set(); // Track requests marked for response interception
 
 // History state
 let historyData = [];
@@ -499,13 +527,23 @@ function handleWebSocketMessage(msg) {
         // Remove from queue
         const removedIndex = interceptQueue.findIndex(r => r.id === msg.id);
         if (removedIndex === -1) {
-            // Request not found in queue, just update table
-            updateInterceptTable();
+            // Check if it's a parent_id (response being forwarded)
+            const parentIndex = interceptQueue.findIndex(r => r.parentId === msg.id);
+            if (parentIndex >= 0) {
+                interceptQueue = interceptQueue.filter(r => r.parentId !== msg.id);
+                markedForResponseIntercept.delete(msg.id);
+                updateInterceptTable();
+                updateInterceptResponseButton();
+            }
             return;
         }
-        
+
+        const removedItem = interceptQueue[removedIndex];
         interceptQueue = interceptQueue.filter(r => r.id !== msg.id);
-        
+
+        // Remove from marked set if it was marked
+        markedForResponseIntercept.delete(msg.id);
+
         // Adjust selected index if needed
         if (removedIndex === selectedInterceptIndex) {
             // The selected item was removed
@@ -526,12 +564,23 @@ function handleWebSocketMessage(msg) {
             // An item after the selected one was removed, just update table
             updateInterceptTable();
         }
+        updateInterceptResponseButton();
     }
     else if (type === 'queue_cleared') {
         interceptQueue = [];
         selectedInterceptIndex = -1;
+        markedForResponseIntercept.clear();
         updateInterceptTable();
-        document.getElementById('intercept-editor').value = '';
+        clearInterceptEditor();
+        updateInterceptResponseButton();
+    }
+    else if (type === 'marked_for_response_intercept') {
+        markedForResponseIntercept.add(msg.id);
+        updateInterceptResponseButton();
+    }
+    else if (type === 'unmarked_for_response_intercept') {
+        markedForResponseIntercept.delete(msg.id);
+        updateInterceptResponseButton();
     }
     
     // HISTORY
@@ -658,9 +707,10 @@ function updateInterceptTable() {
         
         // Check if it's a response
         const isResponse = req.itemType === 'response';
-        const rowClass = isResponse ? 'bg-blue-900/30' : '';
-        const typeLabel = isResponse ? 'RESPONSE' : 'REQUEST';
-        const statusDisplay = isResponse ? `<span class="badge ${getStatusColor(req.statusCode)}">${req.statusCode || '-'}</span>` : 'Waiting';
+        const isMarkedForResponse = markedForResponseIntercept.has(req.id);
+        const rowClass = isResponse ? 'bg-blue-900/30' : (isMarkedForResponse ? 'bg-purple-900/30' : '');
+        const typeLabel = isResponse ? 'RESPONSE' : (isMarkedForResponse ? 'REQUEST →' : 'REQUEST');
+        const statusDisplay = isResponse ? `<span class="badge ${getStatusColor(req.statusCode)}">${req.statusCode || '-'}</span>` : (isMarkedForResponse ? '<span class="text-purple-400">Intercepting</span>' : 'Waiting');
         
         return `
         <tr class="${index === selectedInterceptIndex ? 'selected' : ''} ${rowClass}" onclick="selectInterceptRequest(${index})">
@@ -693,32 +743,124 @@ function getMethodColor(method) {
 function selectInterceptRequest(index) {
     if (index < 0 || index >= interceptQueue.length) {
         clearInterceptEditor();
+        updateInterceptResponseButton();
         return;
     }
-    
+
     selectedInterceptIndex = index;
     const req = interceptQueue[index];
     if (!req) {
         clearInterceptEditor();
+        updateInterceptResponseButton();
         return;
     }
-    
-    // Update editor title based on type
-    const editorTitle = document.querySelector('#content-interceptor h3');
-    
+
+    // Check if this request is marked for response interception
+    const isMarkedForResponse = markedForResponseIntercept.has(req.id);
+
     if (req.itemType === 'response') {
-        // It's a response - show response editor
-        if (editorTitle) editorTitle.textContent = 'Response Editor (Raw)';
-        let raw = req.raw || buildRawResponse(req);
-        document.getElementById('intercept-editor').value = raw;
+        // It's a response - show split view with request and response
+        showSplitPane(req);
     } else {
-        // It's a request - show request editor
-        if (editorTitle) editorTitle.textContent = 'Request Editor (Raw)';
-        let raw = req.raw || buildRawRequest(req);
-        document.getElementById('intercept-editor').value = raw;
+        // It's a request - show single editor
+        showSinglePane(req);
     }
-    
+
+    updateInterceptResponseButton();
     updateInterceptTable();
+}
+
+function showSinglePane(req) {
+    document.getElementById('single-editor-pane').classList.remove('hidden');
+    document.getElementById('split-editor-pane').classList.add('hidden');
+
+    const editorTitle = document.getElementById('single-editor-title');
+    editorTitle.textContent = 'Request Editor (Raw)';
+
+    let raw = req.raw || buildRawRequest(req);
+    document.getElementById('intercept-editor').value = raw;
+}
+
+function showSplitPane(resp) {
+    // Hide single pane, show split pane
+    document.getElementById('single-editor-pane').classList.add('hidden');
+    document.getElementById('split-editor-pane').classList.remove('hidden');
+
+    // Find the parent request
+    const parentReq = interceptQueue.find(r => r.id === resp.parentId);
+
+    // Show request (read-only)
+    if (parentReq) {
+        const requestRaw = parentReq.raw || buildRawRequest(parentReq);
+        document.getElementById('intercept-request-view').value = requestRaw;
+    } else {
+        document.getElementById('intercept-request-view').value = 'Request not available';
+    }
+
+    // Show response (editable)
+    let responseRaw = resp.raw || buildRawResponse(resp);
+    document.getElementById('intercept-response-editor').value = responseRaw;
+}
+
+function updateInterceptResponseButton() {
+    const btn = document.getElementById('intercept-response-btn');
+
+    if (selectedInterceptIndex < 0 || selectedInterceptIndex >= interceptQueue.length) {
+        btn.disabled = true;
+        btn.textContent = 'Intercept Response';
+        btn.style.backgroundColor = '#6b7280';
+        return;
+    }
+
+    const req = interceptQueue[selectedInterceptIndex];
+
+    // Only enable for requests (not responses)
+    if (req.itemType === 'response') {
+        btn.disabled = true;
+        btn.textContent = 'Intercept Response';
+        btn.style.backgroundColor = '#6b7280';
+        return;
+    }
+
+    btn.disabled = false;
+    const isMarked = markedForResponseIntercept.has(req.id);
+
+    if (isMarked) {
+        btn.textContent = 'Cancel Response Intercept';
+        btn.style.backgroundColor = '#ef4444';
+        document.getElementById('response-intercept-status').textContent = 'Response will be intercepted';
+    } else {
+        btn.textContent = 'Intercept Response';
+        btn.style.backgroundColor = '#8b5cf6';
+        document.getElementById('response-intercept-status').textContent = '';
+    }
+}
+
+function markForResponseIntercept() {
+    if (selectedInterceptIndex < 0 || selectedInterceptIndex >= interceptQueue.length) return;
+
+    const req = interceptQueue[selectedInterceptIndex];
+    if (req.itemType === 'response') return;
+
+    const isMarked = markedForResponseIntercept.has(req.id);
+
+    if (isMarked) {
+        // Unmark
+        markedForResponseIntercept.delete(req.id);
+        sendMessage({
+            action: 'unmark_for_response_intercept',
+            id: req.id
+        });
+    } else {
+        // Mark
+        markedForResponseIntercept.add(req.id);
+        sendMessage({
+            action: 'mark_for_response_intercept',
+            id: req.id
+        });
+    }
+
+    updateInterceptResponseButton();
 }
 
 function clearInterceptEditor() {
@@ -726,8 +868,16 @@ function clearInterceptEditor() {
     if (editor) {
         editor.value = '';
     }
-    const editorTitle = document.querySelector('#content-interceptor h3');
+    const editorTitle = document.getElementById('single-editor-title');
     if (editorTitle) editorTitle.textContent = 'Request Editor (Raw)';
+
+    // Also clear split pane
+    document.getElementById('intercept-request-view').value = '';
+    document.getElementById('intercept-response-editor').value = '';
+
+    // Reset to single pane view
+    document.getElementById('single-editor-pane').classList.remove('hidden');
+    document.getElementById('split-editor-pane').classList.add('hidden');
 }
 
 function buildRawRequest(req) {
@@ -840,12 +990,28 @@ function forwardRequest() {
         alert('No request selected');
         return;
     }
-    
+
     const item = interceptQueue[selectedInterceptIndex];
-    const raw = document.getElementById('intercept-editor').value;
-    
-    if (item.itemType === 'response') {
-        // Forward response
+
+    // Check if we're in split pane mode (response interception)
+    const isSplitPane = !document.getElementById('split-editor-pane').classList.contains('hidden');
+
+    if (isSplitPane && item.itemType === 'response') {
+        // Forward response from split pane
+        const responseRaw = document.getElementById('intercept-response-editor').value;
+        const parsed = parseRawResponse(responseRaw);
+        sendMessage({
+            action: 'forward_response',
+            id: item.id,
+            response: {
+                status_code: parsed.statusCode,
+                headers: parsed.headers,
+                body: parsed.body
+            }
+        });
+    } else if (item.itemType === 'response') {
+        // Forward response from single pane (fallback)
+        const raw = document.getElementById('intercept-editor').value;
         const parsed = parseRawResponse(raw);
         sendMessage({
             action: 'forward_response',
@@ -858,10 +1024,11 @@ function forwardRequest() {
         });
     } else {
         // Forward request
+        const raw = document.getElementById('intercept-editor').value;
         const parsed = parseRawRequest(raw);
         const url = new URL(item.url);
         const newUrl = `${url.protocol}//${url.hostname}${parsed.path}`;
-        
+
         sendMessage({
             action: 'forward_request',
             id: item.id,
@@ -873,6 +1040,28 @@ function forwardRequest() {
             }
         });
     }
+}
+
+function updateInterceptedResponse() {
+    if (selectedInterceptIndex < 0 || selectedInterceptIndex >= interceptQueue.length) {
+        alert('No response selected');
+        return;
+    }
+
+    const item = interceptQueue[selectedInterceptIndex];
+    if (item.itemType !== 'response') {
+        alert('No response selected');
+        return;
+    }
+
+    const responseRaw = document.getElementById('intercept-response-editor').value;
+    const parsed = parseRawResponse(responseRaw);
+
+    item.statusCode = parsed.statusCode;
+    item.headers = parsed.headers;
+    item.body = parsed.body;
+
+    updateInterceptTable();
 }
 
 function dropRequest() {
