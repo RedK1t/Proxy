@@ -272,6 +272,27 @@ def get_all_pending_intercepts():
     conn.close()
     return rows
 
+def get_request_by_id(req_id):
+    """Get request data by ID"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT method, url, host, headers, body, raw_request FROM intercept_queue WHERE id = ?", (req_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return {
+                'method': row[0],
+                'url': row[1],
+                'host': row[2],
+                'headers': row[3],
+                'body': row[4],
+                'raw': row[5]
+            }
+        return None
+    except:
+        return None
+
 def forward_all_pending_intercepts():
     """Forward all pending intercepts"""
     conn = sqlite3.connect(DB_FILE)
@@ -539,6 +560,8 @@ async def poll_intercepts():
                 for ws in list(active_websockets):
                     try:
                         if item_type == 'response':
+                            # Get parent request data
+                            parent_request = get_request_by_id(parent_id) if parent_id else None
                             await manager.send_personal_message({
                                 'type': 'intercepted_response',
                                 'id': req_id,
@@ -549,7 +572,8 @@ async def poll_intercepts():
                                 'status_code': status_code,
                                 'response_headers': response_headers,
                                 'response_body': response_body,
-                                'raw_response': raw_response
+                                'raw_response': raw_response,
+                                'parent_request': parent_request
                             }, ws)
                         else:
                             await manager.send_personal_message({
