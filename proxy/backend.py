@@ -80,6 +80,20 @@ def init_database():
         c.execute("ALTER TABLE intercept_queue ADD COLUMN notified INTEGER DEFAULT 0")
         print("[DB Migration] Added 'notified' column to intercept_queue table")
     
+    # Migration: Add response interception columns if they don't exist
+    try:
+        c.execute("SELECT response_headers FROM intercept_queue LIMIT 1")
+    except sqlite3.OperationalError:
+        c.execute("ALTER TABLE intercept_queue ADD COLUMN response_headers TEXT")
+        c.execute("ALTER TABLE intercept_queue ADD COLUMN response_body TEXT")
+        c.execute("ALTER TABLE intercept_queue ADD COLUMN raw_response TEXT")
+        c.execute("ALTER TABLE intercept_queue ADD COLUMN status_code INTEGER")
+        c.execute("ALTER TABLE intercept_queue ADD COLUMN modified_response_headers TEXT")
+        c.execute("ALTER TABLE intercept_queue ADD COLUMN modified_response_body TEXT")
+        c.execute("ALTER TABLE intercept_queue ADD COLUMN item_type TEXT DEFAULT 'request'")
+        c.execute("ALTER TABLE intercept_queue ADD COLUMN parent_id TEXT")
+        print("[DB Migration] Added response interception columns to intercept_queue table")
+    
     # Intercept settings table for IPC
     c.execute("""
         CREATE TABLE IF NOT EXISTS intercept_settings (
@@ -88,8 +102,9 @@ def init_database():
         )
     """)
     
-    # Initialize intercept setting
+    # Initialize intercept settings
     c.execute("INSERT OR REPLACE INTO intercept_settings (key, value) VALUES ('enabled', 'false')")
+    c.execute("INSERT OR REPLACE INTO intercept_settings (key, value) VALUES ('response_enabled', 'false')")
     
     conn.commit()
     conn.close()
@@ -114,6 +129,27 @@ def set_intercept_enabled(enabled: bool):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO intercept_settings (key, value) VALUES ('enabled', ?)", 
+              ('true' if enabled else 'false',))
+    conn.commit()
+    conn.close()
+
+def is_response_intercept_enabled():
+    """Check if response interception is enabled via database"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT value FROM intercept_settings WHERE key = 'response_enabled'")
+        row = c.fetchone()
+        conn.close()
+        return row and row[0] == 'true'
+    except:
+        return False
+
+def set_response_intercept_enabled(enabled: bool):
+    """Set response interception enabled status"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO intercept_settings (key, value) VALUES ('response_enabled', ?)", 
               ('true' if enabled else 'false',))
     conn.commit()
     conn.close()
@@ -183,6 +219,23 @@ def clear_intercept_queue():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("DELETE FROM intercept_queue")
+    conn.commit()
+    conn.close()
+
+def get_all_pending_intercepts():
+    """Get all pending intercepts"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, method, url, host, headers, body FROM intercept_queue WHERE status = 'pending'")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def forward_all_pending_intercepts():
+    """Forward all pending intercepts"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE intercept_queue SET status = 'forward' WHERE status = 'pending'")
     conn.commit()
     conn.close()
 
@@ -450,6 +503,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 global intercept_enabled
                 intercept_enabled = data.get('enabled', False)
                 set_intercept_enabled(intercept_enabled)
+                
+                # If turning OFF intercept, auto-forward all pending requests
+                if not intercept_enabled:
+                    pending_count = len(get_all_pending_intercepts())
+                    if pending_count > 0:
+                        forward_all_pending_intercepts()
+                        # Notify all clients to clear their queues
+                        await manager.broadcast({'type': 'queue_cleared'})
+                
                 await manager.send_personal_message({'type': 'intercept_status', 'enabled': intercept_enabled}, websocket)
             
             elif action == 'forward_request':
@@ -614,6 +676,9 @@ def dashboard():
     except FileNotFoundError:
         return HTMLResponse(content="<h1>index.html not found</h1>")
 
+# Global storage for intercepted flows
+intercepted_flows = {}
+
 # Mitmproxy Addons
 if MITMPROXY_AVAILABLE:
     class GUIInterceptAddon:
@@ -623,6 +688,10 @@ if MITMPROXY_AVAILABLE:
             self.excluded_hosts = ["127.0.0.1", "localhost", "0.0.0.0"]
             self.excluded_ports = [5050]
             self.excluded_patterns = [r"/ws"]
+            self.stop_processing = False
+            # Start background thread to process intercepted flows
+            self.processing_thread = threading.Thread(target=self._process_intercepted_flows, daemon=True)
+            self.processing_thread.start()
         
         def should_intercept(self, flow):
             if flow.request.host in self.excluded_hosts:
@@ -633,6 +702,56 @@ if MITMPROXY_AVAILABLE:
                 if re.search(pattern, flow.request.path):
                     return False
             return True
+        
+        def _process_intercepted_flows(self):
+            """Background thread that processes intercepted flows"""
+            while not self.stop_processing:
+                try:
+                    # Get all pending intercepts from database
+                    conn = sqlite3.connect(DB_FILE)
+                    c = conn.cursor()
+                    c.execute("SELECT id, status, modified_method, modified_url, modified_headers, modified_body FROM intercept_queue WHERE status != 'pending'")
+                    rows = c.fetchall()
+                    conn.close()
+                    
+                    for row in rows:
+                        req_id, action, mod_method, mod_url, mod_headers, mod_body = row
+                        
+                        # Find the corresponding flow
+                        if req_id in intercepted_flows:
+                            flow = intercepted_flows.pop(req_id)
+                            
+                            if action == 'drop':
+                                flow.response = http.Response.make(403, b"Request Dropped by Interceptor")
+                            elif action == 'forward':
+                                # Apply any modifications
+                                if mod_method:
+                                    flow.request.method = mod_method
+                                if mod_url:
+                                    flow.request.url = mod_url
+                                if mod_headers:
+                                    new_headers = {}
+                                    for line in mod_headers.split('\n'):
+                                        if ':' in line:
+                                            k, v = line.split(':', 1)
+                                            new_headers[k.strip()] = v.strip()
+                                    flow.request.headers.clear()
+                                    for k, v in new_headers.items():
+                                        flow.request.headers[k] = v
+                                if mod_body is not None:
+                                    flow.request.text = mod_body
+                            
+                            # Resume the flow
+                            if hasattr(flow, 'resume'):
+                                flow.resume()
+                            
+                            # Remove from database
+                            remove_from_intercept_queue(req_id)
+                    
+                    time.sleep(0.1)  # Poll every 100ms
+                except Exception as e:
+                    print(f"Error in processing thread: {e}")
+                    time.sleep(0.5)
         
         def request(self, flow):
             # Check if intercept is enabled via database (IPC)
@@ -664,45 +783,9 @@ if MITMPROXY_AVAILABLE:
                 raw_request
             )
             
-            # Wait for user action (poll database)
-            timeout = 300  # 5 minutes
-            waited = 0
-            while waited < timeout:
-                status_row = get_intercept_status(req_id)
-                if status_row and status_row[0] != 'pending':
-                    break
-                time.sleep(0.1)
-                waited += 0.1
-            
-            # Get final status
-            status_row = get_intercept_status(req_id)
-            action = status_row[0] if status_row else 'forward'
-            
-            if action == 'drop':
-                flow.response = http.Response.make(403, b"Request Dropped by Interceptor")
-            elif action == 'forward':
-                # Apply any modifications
-                if status_row:
-                    mod_method, mod_url, mod_headers, mod_body = status_row[1], status_row[2], status_row[3], status_row[4]
-                    if mod_method:
-                        flow.request.method = mod_method
-                    if mod_url:
-                        flow.request.url = mod_url
-                    if mod_headers:
-                        # Parse headers
-                        new_headers = {}
-                        for line in mod_headers.split('\n'):
-                            if ':' in line:
-                                k, v = line.split(':', 1)
-                                new_headers[k.strip()] = v.strip()
-                        flow.request.headers.clear()
-                        for k, v in new_headers.items():
-                            flow.request.headers[k] = v
-                    if mod_body is not None:
-                        flow.request.text = mod_body
-            
-            # Clean up
-            remove_from_intercept_queue(req_id)
+            # Store flow reference and intercept (NON-BLOCKING)
+            intercepted_flows[req_id] = flow
+            flow.intercept()  # This pauses the flow without blocking mitmproxy
         
         def response(self, flow):
             # Save to history
