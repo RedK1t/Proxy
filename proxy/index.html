@@ -428,6 +428,7 @@ function handleWebSocketMessage(msg) {
             return; // Already exists, ignore
         }
         
+        // Add new request to the END of queue (newest at bottom)
         interceptQueue.push({
             id: msg.id,
             method: msg.method,
@@ -439,33 +440,42 @@ function handleWebSocketMessage(msg) {
         });
         updateInterceptTable();
         
-        // Only auto-select if no request is currently selected
+        // Auto-select the newest request if nothing is selected
         if (selectedInterceptIndex === -1) {
-            selectInterceptRequest(interceptQueue.length - 1);
+            selectedInterceptIndex = interceptQueue.length - 1;
+            selectInterceptRequest(selectedInterceptIndex);
+            
+            // Auto-scroll to show the selected request
+            setTimeout(() => {
+                const tableContainer = document.querySelector('.top-pane');
+                if (tableContainer) {
+                    tableContainer.scrollTop = tableContainer.scrollHeight;
+                }
+            }, 100);
         }
-        
-        // Auto-scroll to bottom (most recent)
-        setTimeout(() => {
-            const tableContainer = document.querySelector('.top-pane');
-            if (tableContainer) {
-                tableContainer.scrollTop = tableContainer.scrollHeight;
-            }
-        }, 100);
     }
     else if (type === 'forwarded' || type === 'dropped') {
         // Remove from queue
         const removedIndex = interceptQueue.findIndex(r => r.id === msg.id);
+        if (removedIndex === -1) {
+            // Request not found in queue, just update table
+            updateInterceptTable();
+            return;
+        }
+        
         interceptQueue = interceptQueue.filter(r => r.id !== msg.id);
         
         // Adjust selected index if needed
         if (removedIndex === selectedInterceptIndex) {
-            // The selected item was removed, select the next one or previous
+            // The selected item was removed
             if (interceptQueue.length > 0) {
+                // Select the next item, or the last one if we removed the last
                 selectedInterceptIndex = Math.min(removedIndex, interceptQueue.length - 1);
                 selectInterceptRequest(selectedInterceptIndex);
             } else {
                 selectedInterceptIndex = -1;
                 clearInterceptEditor();
+                updateInterceptTable();
             }
         } else if (removedIndex < selectedInterceptIndex) {
             // An item before the selected one was removed, adjust index
@@ -571,15 +581,25 @@ function updateInterceptTable() {
         return;
     }
     
+    // Display requests: Oldest at top (index 0), newest at bottom
+    // The interceptQueue array maintains order - oldest are at the beginning
     tbody.innerHTML = interceptQueue.map((req, index) => {
-        const url = new URL(req.url);
+        let url;
+        try {
+            url = new URL(req.url);
+        } catch (e) {
+            url = { hostname: 'unknown', pathname: req.url, search: '' };
+        }
+        const displayUrl = url.pathname + url.search;
+        const truncatedUrl = displayUrl.length > 50 ? displayUrl.substring(0, 50) + '...' : displayUrl;
+        
         return `
         <tr class="${index === selectedInterceptIndex ? 'selected' : ''}" onclick="selectInterceptRequest(${index})">
             <td>${index + 1}</td>
             <td><span class="badge ${getMethodColor(req.method)}">${req.method}</span></td>
             <td>${url.hostname}</td>
-            <td class="truncate max-w-xs">${url.pathname}${url.search}</td>
-            <td>-</td>
+            <td class="truncate max-w-xs" title="${displayUrl}">${truncatedUrl}</td>
+            <td>Waiting</td>
         </tr>
     `}).join('');
 }
@@ -721,15 +741,24 @@ function dropRequest() {
 function forwardAll() {
     if (interceptQueue.length === 0) return;
     
+    // Store the requests to forward
+    const requestsToForward = interceptQueue.map(r => ({
+        id: r.id,
+        method: r.method,
+        url: r.url,
+        headers: r.headers,
+        body: r.body
+    }));
+    
+    // Immediately clear the local queue to prevent UI inconsistencies
+    interceptQueue = [];
+    selectedInterceptIndex = -1;
+    clearInterceptEditor();
+    updateInterceptTable();
+    
     sendMessage({
         action: 'forward_all',
-        requests: interceptQueue.map(r => ({
-            id: r.id,
-            method: r.method,
-            url: r.url,
-            headers: r.headers,
-            body: r.body
-        }))
+        requests: requestsToForward
     });
 }
 
@@ -738,9 +767,18 @@ function dropAll() {
     
     if (!confirm(`Drop all ${interceptQueue.length} intercepted requests?`)) return;
     
+    // Store IDs before clearing
+    const idsToDrop = interceptQueue.map(r => r.id);
+    
+    // Immediately clear the local queue to prevent UI inconsistencies
+    interceptQueue = [];
+    selectedInterceptIndex = -1;
+    clearInterceptEditor();
+    updateInterceptTable();
+    
     sendMessage({
         action: 'drop_all',
-        ids: interceptQueue.map(r => r.id)
+        ids: idsToDrop
     });
 }
 
