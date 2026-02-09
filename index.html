@@ -505,7 +505,8 @@ function handleWebSocketMessage(msg) {
             body: msg.response_body,
             raw: msg.raw_response,
             itemType: 'response',
-            parentId: msg.parent_id
+            parentId: msg.parent_id,
+            parentRequest: msg.parent_request
         });
         updateInterceptTable();
         
@@ -786,8 +787,8 @@ function showSplitPane(resp) {
     document.getElementById('single-editor-pane').classList.add('hidden');
     document.getElementById('split-editor-pane').classList.remove('hidden');
 
-    // Find the parent request
-    const parentReq = interceptQueue.find(r => r.id === resp.parentId);
+    // Use parent request data from response (sent by backend)
+    const parentReq = resp.parentRequest;
 
     // Show request (read-only)
     if (parentReq) {
