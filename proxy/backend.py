@@ -1,35 +1,26 @@
 """
-RedKit Proxy - Consolidated Backend
-A Burp Suite-like web proxy with Interceptor, Repeater, Intruder, and HTTP History
+RedKit Proxy - WebSocket-Only Backend with GUI Interceptor
+Uses SQLite for IPC between FastAPI and mitmproxy addon
 """
 
-# =============================================================================
-# IMPORTS
-# =============================================================================
-from fastapi import FastAPI, WebSocket, BackgroundTasks
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
-from dataclasses import dataclass, asdict
-from enum import Enum
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor
 import sqlite3
-import subprocess
-import shlex
 import uvicorn
 import json
 import asyncio
 import requests
 import urllib3
-import threading
 import time
 import re
-import os
 import datetime
-from itertools import product
+import uuid
+import threading
 
-# Mitmproxy imports (for addon mode)
+# Mitmproxy imports
 try:
     from mitmproxy import http
     MITMPROXY_AVAILABLE = True
@@ -37,18 +28,16 @@ except ImportError:
     MITMPROXY_AVAILABLE = False
     print("[WARNING] mitmproxy not available - running in API-only mode")
 
-# Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# =============================================================================
-# DATABASE SETUP
-# =============================================================================
+# Database
 DB_FILE = "proxy_history.db"
 
 def init_database():
-    """Initialize SQLite database for proxy history"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    
+    # History table
     c.execute("""
         CREATE TABLE IF NOT EXISTS history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,1309 +51,683 @@ def init_database():
             time TEXT
         )
     """)
+    
+    # Intercept queue table for IPC
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS intercept_queue (
+            id TEXT PRIMARY KEY,
+            method TEXT,
+            url TEXT,
+            host TEXT,
+            headers TEXT,
+            body TEXT,
+            raw_request TEXT,
+            status TEXT DEFAULT 'pending',
+            notified INTEGER DEFAULT 0,
+            modified_method TEXT,
+            modified_url TEXT,
+            modified_headers TEXT,
+            modified_body TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Migration: Add notified column if it doesn't exist
+    try:
+        c.execute("SELECT notified FROM intercept_queue LIMIT 1")
+    except sqlite3.OperationalError:
+        # Column doesn't exist, add it
+        c.execute("ALTER TABLE intercept_queue ADD COLUMN notified INTEGER DEFAULT 0")
+        print("[DB Migration] Added 'notified' column to intercept_queue table")
+    
+    # Intercept settings table for IPC
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS intercept_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    
+    # Initialize intercept setting
+    c.execute("INSERT OR REPLACE INTO intercept_settings (key, value) VALUES ('enabled', 'false')")
+    
     conn.commit()
     conn.close()
 
 init_database()
 
-# =============================================================================
-# REPEATER MODULE
-# =============================================================================
-@dataclass
-class RepeaterRequest:
-    """Represents an HTTP Request"""
-    method: str
-    url: str
-    headers: Dict[str, str]
-    body: str = ""
-    timeout: int = 30
-    follow_redirects: bool = True
-    verify_ssl: bool = False
-
-@dataclass
-class RepeaterResponse:
-    """Represents an HTTP Response"""
-    status_code: int
-    headers: Dict[str, str]
-    body: str
-    elapsed_time: float
-    size: int
-    error: Optional[str] = None
-
-class Repeater:
-    """Manual HTTP request sender - like Burp Repeater"""
-    
-    def __init__(self):
-        self.history: list = []
-        self.session = requests.Session()
-    
-    def send(self, req: RepeaterRequest) -> RepeaterResponse:
-        """Send an HTTP request and return response"""
-        start_time = time.time()
-        
-        try:
-            headers = req.headers.copy() if req.headers else {}
-            
-            response = self.session.request(
-                method=req.method.upper(),
-                url=req.url,
-                headers=headers,
-                data=req.body if req.body else None,
-                timeout=req.timeout,
-                allow_redirects=req.follow_redirects,
-                verify=req.verify_ssl
-            )
-            
-            elapsed = time.time() - start_time
-            
-            resp = RepeaterResponse(
-                status_code=response.status_code,
-                headers=dict(response.headers),
-                body=response.text,
-                elapsed_time=round(elapsed, 3),
-                size=len(response.content)
-            )
-            
-            self._save_to_history(req, resp)
-            return resp
-            
-        except requests.exceptions.Timeout:
-            return RepeaterResponse(
-                status_code=0, headers={}, body="",
-                elapsed_time=time.time() - start_time, size=0,
-                error="Request Timeout"
-            )
-        except requests.exceptions.ConnectionError as e:
-            return RepeaterResponse(
-                status_code=0, headers={}, body="",
-                elapsed_time=time.time() - start_time, size=0,
-                error=f"Connection Error: {str(e)}"
-            )
-        except Exception as e:
-            return RepeaterResponse(
-                status_code=0, headers={}, body="",
-                elapsed_time=time.time() - start_time, size=0,
-                error=f"Error: {str(e)}"
-            )
-    
-    def send_raw(self, raw_request: str, target_host: str, use_https: bool = True) -> RepeaterResponse:
-        """Send a raw HTTP request"""
-        try:
-            parsed = self._parse_raw_request(raw_request, target_host, use_https)
-            return self.send(parsed)
-        except Exception as e:
-            return RepeaterResponse(
-                status_code=0, headers={}, body="",
-                elapsed_time=0, size=0,
-                error=f"Parse Error: {str(e)}"
-            )
-    
-    def _parse_raw_request(self, raw: str, host: str, use_https: bool) -> RepeaterRequest:
-        """Parse raw HTTP request into RepeaterRequest"""
-        lines = raw.strip().split('\n')
-        first_line = lines[0].strip()
-        parts = first_line.split(' ')
-        method = parts[0]
-        path = parts[1] if len(parts) > 1 else '/'
-        
-        headers = {}
-        body_start = 0
-        
-        for i, line in enumerate(lines[1:], 1):
-            line = line.strip()
-            if line == '':
-                body_start = i + 1
-                break
-            if ':' in line:
-                key, value = line.split(':', 1)
-                headers[key.strip()] = value.strip()
-        
-        body = '\n'.join(lines[body_start:]) if body_start > 0 and body_start < len(lines) else ''
-        
-        protocol = 'https' if use_https else 'http'
-        url = f"{protocol}://{host}{path}"
-        
-        return RepeaterRequest(method=method, url=url, headers=headers, body=body)
-    
-    def _save_to_history(self, req: RepeaterRequest, resp: RepeaterResponse):
-        """Save request/response to history"""
-        entry = {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "request": asdict(req),
-            "response": asdict(resp)
-        }
-        self.history.append(entry)
-    
-    def get_history(self) -> list:
-        return self.history
-    
-    def clear_history(self):
-        self.history = []
-
-def send_from_history(history_id: int, db_path: str = DB_FILE) -> RepeaterResponse:
-    """Resend a request from the history database"""
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT method, url, request_headers, request_body FROM history WHERE id = ?",
-        (history_id,)
-    )
-    row = cur.fetchone()
-    conn.close()
-    
-    if not row:
-        return RepeaterResponse(
-            status_code=0, headers={}, body="",
-            elapsed_time=0, size=0,
-            error=f"Request ID {history_id} not found"
-        )
-    
-    method, url, headers_str, body = row
-    
+# Helper functions for IPC
+def is_intercept_enabled():
+    """Check if interception is enabled via database"""
     try:
-        headers = json.loads(headers_str) if headers_str else {}
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT value FROM intercept_settings WHERE key = 'enabled'")
+        row = c.fetchone()
+        conn.close()
+        return row and row[0] == 'true'
     except:
-        headers = {}
-    
-    repeater = Repeater()
-    req = RepeaterRequest(method=method, url=url, headers=headers, body=body or "")
-    return repeater.send(req)
+        return False
 
-# =============================================================================
-# INTRUDER MODULE
-# =============================================================================
-class AttackType(Enum):
-    SNIPER = "sniper"
-    BATTERING_RAM = "battering_ram"
-    PITCHFORK = "pitchfork"
-    CLUSTER_BOMB = "cluster_bomb"
+def set_intercept_enabled(enabled: bool):
+    """Set interception enabled status"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO intercept_settings (key, value) VALUES ('enabled', ?)", 
+              ('true' if enabled else 'false',))
+    conn.commit()
+    conn.close()
 
-@dataclass
-class IntruderRequest:
-    """Request template for Intruder attacks"""
-    method: str
-    url: str
-    headers: Dict[str, str]
-    body: str = ""
-    timeout: int = 30
-    verify_ssl: bool = False
+def add_to_intercept_queue(req_id, method, url, host, headers, body, raw_request):
+    """Add request to intercept queue"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO intercept_queue (id, method, url, host, headers, body, raw_request, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+    """, (req_id, method, url, host, headers, body, raw_request))
+    conn.commit()
+    conn.close()
 
-@dataclass
-class IntruderResult:
-    """Result of a single Intruder request"""
-    payload: str
-    payload_position: int
-    status_code: int
-    response_length: int
-    elapsed_time: float
-    error: Optional[str] = None
-    response_body: str = ""
-    response_headers: Dict[str, str] = None
-    
-    def __post_init__(self):
-        if self.response_headers is None:
-            self.response_headers = {}
+def get_intercept_status(req_id):
+    """Get the status of an intercepted request"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT status, modified_method, modified_url, modified_headers, modified_body FROM intercept_queue WHERE id = ?", (req_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
 
+def update_intercept_status(req_id, status, modified=None):
+    """Update intercept status (called from WebSocket)"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if modified:
+        c.execute("""
+            UPDATE intercept_queue 
+            SET status = ?, modified_method = ?, modified_url = ?, modified_headers = ?, modified_body = ?
+            WHERE id = ?
+        """, (status, modified.get('method'), modified.get('url'), modified.get('headers'), modified.get('body'), req_id))
+    else:
+        c.execute("UPDATE intercept_queue SET status = ? WHERE id = ?", (status, req_id))
+    conn.commit()
+    conn.close()
+
+def remove_from_intercept_queue(req_id):
+    """Remove request from queue"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM intercept_queue WHERE id = ?", (req_id,))
+    conn.commit()
+    conn.close()
+
+def get_pending_intercepts():
+    """Get all pending intercepts that haven't been notified yet"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, method, url, host, headers, body, raw_request FROM intercept_queue WHERE status = 'pending' AND notified = 0 ORDER BY created_at")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def mark_intercept_notified(req_id):
+    """Mark an intercept as notified"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE intercept_queue SET notified = 1 WHERE id = ?", (req_id,))
+    conn.commit()
+    conn.close()
+
+def clear_intercept_queue():
+    """Clear all intercepts"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM intercept_queue")
+    conn.commit()
+    conn.close()
+
+# Payload Generator
 class PayloadGenerator:
-    """Generate various types of payloads for attacks"""
+    @staticmethod
+    def common_passwords():
+        return ["123456", "password", "12345678", "qwerty", "admin", "root", "toor", "guest"]
     
     @staticmethod
-    def from_list(payloads: List[str]) -> List[str]:
-        return payloads
+    def common_usernames():
+        return ["admin", "administrator", "root", "user", "test", "guest"]
     
     @staticmethod
-    def from_file(filepath: str) -> List[str]:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            return [line.strip() for line in f if line.strip()]
+    def sqli_payloads():
+        return ["'", "' OR '1'='1", "' OR 1=1--", "admin'--", "1' ORDER BY 1--"]
     
     @staticmethod
-    def numbers(start: int, end: int, step: int = 1) -> List[str]:
+    def xss_payloads():
+        return ["<script>alert(1)</script>", "<img src=x onerror=alert(1)>"]
+    
+    @staticmethod
+    def path_traversal_payloads():
+        return ["../", "../../", "../../../etc/passwd"]
+    
+    @staticmethod
+    def numbers(start, end, step=1):
         return [str(i) for i in range(start, end + 1, step)]
-    
-    @staticmethod
-    def common_passwords() -> List[str]:
-        return [
-            "123456", "password", "12345678", "qwerty", "123456789",
-            "12345", "1234", "111111", "1234567", "dragon",
-            "123123", "baseball", "abc123", "football", "monkey",
-            "letmein", "696969", "shadow", "master", "666666",
-            "qwertyuiop", "123321", "mustang", "1234567890", "michael",
-            "654321", "superman", "1qaz2wsx", "7777777",
-            "fuckyou", "121212", "000000", "qazwsx", "123qwe",
-            "killer", "trustno1", "jordan", "jennifer", "zxcvbnm",
-            "asdfgh", "hunter", "buster", "soccer", "harley",
-            "batman", "andrew", "tigger", "sunshine", "iloveyou",
-            "2000", "charlie", "robert", "thomas",
-            "hockey", "ranger", "daniel", "starwars", "klaster",
-            "112233", "george", "asshole", "computer", "michelle",
-            "jessica", "pepper", "1111", "zxcvbn", "555555",
-            "11111111", "131313", "freedom", "777777", "pass",
-            "fuck", "maggie", "159753", "aaaaaa", "ginger",
-            "princess", "joshua", "cheese", "amanda", "summer",
-            "love", "ashley", "6969", "nicole", "chelsea",
-            "biteme", "matthew", "access", "yankees", "987654321",
-            "dallas", "austin", "thunder", "taylor", "matrix",
-            "admin", "root", "toor", "test", "guest"
-        ]
-    
-    @staticmethod
-    def common_usernames() -> List[str]:
-        return [
-            "admin", "administrator", "root", "user", "test",
-            "guest", "info", "adm", "mysql", "oracle",
-            "ftp", "pi", "puppet", "ansible", "ec2-user",
-            "vagrant", "azureuser", "demo", "ubuntu", "centos",
-            "support", "manager", "operator", "backup", "web",
-            "www", "www-data", "apache", "nginx", "tomcat"
-        ]
-    
-    @staticmethod
-    def sqli_payloads() -> List[str]:
-        return [
-            "'", "''", "\"", "\"\"",
-            "' OR '1'='1", "' OR '1'='1'--", "' OR '1'='1'/*",
-            "\" OR \"1\"=\"1", "\" OR \"1\"=\"1\"--",
-            "' OR 1=1--", "' OR 1=1#", "' OR 1=1/*",
-            "admin'--", "admin'#", "admin'/*",
-            "') OR ('1'='1", "') OR ('1'='1'--",
-            "1' ORDER BY 1--", "1' ORDER BY 2--", "1' ORDER BY 3--",
-            "1' UNION SELECT NULL--", "1' UNION SELECT NULL,NULL--",
-            "1; DROP TABLE users--", "1'; DROP TABLE users--",
-            "' AND '1'='1", "' AND '1'='2",
-            "1 AND 1=1", "1 AND 1=2",
-            "' WAITFOR DELAY '0:0:5'--",
-            "'; WAITFOR DELAY '0:0:5'--",
-            "1; WAITFOR DELAY '0:0:5'--",
-            "' AND SLEEP(5)--", "' OR SLEEP(5)--"
-        ]
-    
-    @staticmethod
-    def xss_payloads() -> List[str]:
-        return [
-            "<script>alert('XSS')</script>",
-            "<script>alert(1)</script>",
-            "<img src=x onerror=alert('XSS')>",
-            "<img src=x onerror=alert(1)>",
-            "<svg onload=alert('XSS')>",
-            "<body onload=alert('XSS')>",
-            "javascript:alert('XSS')",
-            "<iframe src=\"javascript:alert('XSS')\">",
-            "<a href=\"javascript:alert('XSS')\">click</a>",
-            "'\"><script>alert('XSS')</script>",
-            "'-alert(1)-'",
-            "\"-alert(1)-\"",
-            "<ScRiPt>alert('XSS')</ScRiPt>",
-            "<scr<script>ipt>alert('XSS')</scr</script>ipt>",
-            "<<script>alert('XSS');//<</script>",
-            "<img src=\"x\" onerror=\"alert('XSS')\">",
-            "<div onmouseover=\"alert('XSS')\">hover me</div>",
-            "<input onfocus=alert('XSS') autofocus>",
-            "<marquee onstart=alert('XSS')>",
-            "<video><source onerror=\"alert('XSS')\"></video>"
-        ]
-    
-    @staticmethod
-    def path_traversal_payloads() -> List[str]:
-        return [
-            "../", "..\\", "....//", "....\\\\",
-            "../../../etc/passwd",
-            "..\\..\\..\\windows\\system32\\config\\sam",
-            "....//....//....//etc/passwd",
-            "%2e%2e%2f", "%2e%2e/", "..%2f",
-            "%2e%2e%5c", "%2e%2e\\", "..%5c",
-            "..%252f", "..%255c",
-            "/etc/passwd", "/etc/shadow",
-            "C:\\Windows\\System32\\config\\SAM",
-            "file:///etc/passwd",
-            "....//....//....//....//etc/passwd"
-        ]
 
+# Intruder
 class Intruder:
-    """Automated HTTP attack tool - like Burp Intruder"""
-    
     POSITION_MARKER = "§"
     
-    def __init__(self, threads: int = 10):
+    def __init__(self, threads=10):
         self.threads = threads
-        self.results: List[IntruderResult] = []
+        self.results = []
         self.session = requests.Session()
         self.stop_flag = False
-        self.progress_callback = None
     
-    def find_positions(self, template: str) -> List[tuple]:
-        """Find injection positions marked with §"""
-        positions = []
+    def find_positions(self, template):
         pattern = re.compile(f'{self.POSITION_MARKER}(.*?){self.POSITION_MARKER}')
-        for match in pattern.finditer(template):
-            positions.append((match.start(), match.end(), match.group(1)))
-        return positions
+        return [(m.start(), m.end(), m.group(1)) for m in pattern.finditer(template)]
     
-    def replace_position(self, template: str, position_index: int, payload: str) -> str:
-        """Replace a specific position with payload"""
+    def replace_position(self, template, pos_idx, payload):
         positions = self.find_positions(template)
-        if position_index >= len(positions):
+        if pos_idx >= len(positions):
             return template
-        
         result = template
         for i, (start, end, _) in enumerate(reversed(positions)):
-            actual_index = len(positions) - 1 - i
-            if actual_index == position_index:
+            actual = len(positions) - 1 - i
+            if actual == pos_idx:
                 result = result[:start] + payload + result[end:]
             else:
-                result = result[:start] + positions[actual_index][2] + result[end:]
+                result = result[:start] + positions[actual][2] + result[end:]
         return result
     
-    def replace_all_positions(self, template: str, payload: str) -> str:
-        """Replace all positions with the same payload"""
+    def replace_all_positions(self, template, payload):
         pattern = re.compile(f'{self.POSITION_MARKER}(.*?){self.POSITION_MARKER}')
         return pattern.sub(payload, template)
     
-    def _send_request(self, req: IntruderRequest, payload: str, position: int) -> IntruderResult:
-        """Send a single request"""
-        start_time = time.time()
-        
-        try:
-            response = self.session.request(
-                method=req.method.upper(),
-                url=req.url,
-                headers=req.headers,
-                data=req.body if req.body else None,
-                timeout=req.timeout,
-                verify=req.verify_ssl
-            )
-            
-            elapsed = time.time() - start_time
-            
-            return IntruderResult(
-                payload=payload,
-                payload_position=position,
-                status_code=response.status_code,
-                response_length=len(response.content),
-                elapsed_time=round(elapsed, 3),
-                response_body=response.text,
-                response_headers=dict(response.headers)
-            )
-            
-        except Exception as e:
-            return IntruderResult(
-                payload=payload,
-                payload_position=position,
-                status_code=0,
-                response_length=0,
-                elapsed_time=time.time() - start_time,
-                error=str(e)
-            )
-    
-    def attack_sniper(self, template: IntruderRequest, payloads: List[str]) -> List[IntruderResult]:
-        """Sniper attack - one payload at one position at a time"""
+    def attack_sniper(self, template, payloads):
         self.results = []
         self.stop_flag = False
-        
-        all_text = f"{template.url}\n{json.dumps(template.headers)}\n{template.body}"
+        all_text = f"{template['url']}\n{json.dumps(template.get('headers', {}))}\n{template.get('body', '')}"
         positions = self.find_positions(all_text)
         
-        total = len(payloads) * len(positions) if positions else len(payloads)
-        current = 0
+        def send_request(req_data, payload, pos):
+            start = time.time()
+            try:
+                resp = self.session.request(
+                    method=req_data['method'].upper(),
+                    url=req_data['url'],
+                    headers=req_data.get('headers', {}),
+                    data=req_data.get('body') if req_data.get('body') else None,
+                    timeout=req_data.get('timeout', 30),
+                    verify=False
+                )
+                return {
+                    'payload': payload, 'position': pos,
+                    'status_code': resp.status_code,
+                    'length': len(resp.content),
+                    'time': round(time.time() - start, 3),
+                    'error': None
+                }
+            except Exception as e:
+                return {'payload': payload, 'position': pos, 'status_code': 0, 'length': 0, 'time': time.time() - start, 'error': str(e)}
         
-        with ThreadPoolExecutor(max_workers=self.threads) as executor:
+        with ThreadPoolExecutor(max_workers=self.threads) as exe:
             futures = []
-            
             if positions:
-                for pos_index in range(len(positions)):
+                for pos_idx in range(len(positions)):
                     for payload in payloads:
                         if self.stop_flag:
                             break
-                        
-                        new_url = self.replace_position(template.url, pos_index, payload)
-                        new_headers = {k: self.replace_position(v, pos_index, payload) 
-                                       for k, v in template.headers.items()}
-                        new_body = self.replace_position(template.body, pos_index, payload)
-                        
-                        req = IntruderRequest(
-                            method=template.method,
-                            url=new_url,
-                            headers=new_headers,
-                            body=new_body,
-                            timeout=template.timeout,
-                            verify_ssl=template.verify_ssl
-                        )
-                        
-                        futures.append(executor.submit(self._send_request, req, payload, pos_index))
+                        new_url = self.replace_position(template['url'], pos_idx, payload)
+                        new_headers = {k: self.replace_position(v, pos_idx, payload) for k, v in template.get('headers', {}).items()}
+                        new_body = self.replace_position(template.get('body', ''), pos_idx, payload)
+                        req = {'method': template['method'], 'url': new_url, 'headers': new_headers, 'body': new_body, 'timeout': template.get('timeout', 30)}
+                        futures.append(exe.submit(send_request, req, payload, pos_idx))
             else:
-                # No positions found, just send payloads as query params
                 for payload in payloads:
                     if self.stop_flag:
                         break
-                    req = IntruderRequest(
-                        method=template.method,
-                        url=template.url,
-                        headers=template.headers,
-                        body=template.body,
-                        timeout=template.timeout,
-                        verify_ssl=template.verify_ssl
-                    )
-                    futures.append(executor.submit(self._send_request, req, payload, 0))
+                    futures.append(exe.submit(send_request, template, payload, 0))
             
-            for future in as_completed(futures):
-                if self.stop_flag:
-                    break
-                result = future.result()
-                self.results.append(result)
-                current += 1
+            for f in futures:
+                if not self.stop_flag:
+                    self.results.append(f.result())
         
         return self.results
     
-    def attack_battering_ram(self, template: IntruderRequest, payloads: List[str]) -> List[IntruderResult]:
-        """Battering Ram - same payload in all positions"""
+    def attack_battering_ram(self, template, payloads):
         self.results = []
         self.stop_flag = False
         
-        total = len(payloads)
-        current = 0
+        def send_request(req_data, payload):
+            start = time.time()
+            try:
+                resp = self.session.request(
+                    method=req_data['method'].upper(),
+                    url=req_data['url'],
+                    headers=req_data.get('headers', {}),
+                    data=req_data.get('body') if req_data.get('body') else None,
+                    timeout=req_data.get('timeout', 30),
+                    verify=False
+                )
+                return {'payload': payload, 'position': -1, 'status_code': resp.status_code, 'length': len(resp.content), 'time': round(time.time() - start, 3), 'error': None}
+            except Exception as e:
+                return {'payload': payload, 'position': -1, 'status_code': 0, 'length': 0, 'time': time.time() - start, 'error': str(e)}
         
-        with ThreadPoolExecutor(max_workers=self.threads) as executor:
+        with ThreadPoolExecutor(max_workers=self.threads) as exe:
             futures = []
-            
             for payload in payloads:
                 if self.stop_flag:
                     break
-                
-                new_url = self.replace_all_positions(template.url, payload)
-                new_headers = {k: self.replace_all_positions(v, payload) 
-                               for k, v in template.headers.items()}
-                new_body = self.replace_all_positions(template.body, payload)
-                
-                req = IntruderRequest(
-                    method=template.method,
-                    url=new_url,
-                    headers=new_headers,
-                    body=new_body,
-                    timeout=template.timeout,
-                    verify_ssl=template.verify_ssl
-                )
-                
-                futures.append(executor.submit(self._send_request, req, payload, -1))
+                new_url = self.replace_all_positions(template['url'], payload)
+                new_headers = {k: self.replace_all_positions(v, payload) for k, v in template.get('headers', {}).items()}
+                new_body = self.replace_all_positions(template.get('body', ''), payload)
+                req = {'method': template['method'], 'url': new_url, 'headers': new_headers, 'body': new_body, 'timeout': template.get('timeout', 30)}
+                futures.append(exe.submit(send_request, req, payload))
             
-            for future in as_completed(futures):
-                if self.stop_flag:
-                    break
-                result = future.result()
-                self.results.append(result)
-                current += 1
-        
-        return self.results
-    
-    def attack_pitchfork(self, template: IntruderRequest, payload_sets: List[List[str]]) -> List[IntruderResult]:
-        """Pitchfork - parallel payloads"""
-        self.results = []
-        self.stop_flag = False
-        
-        min_len = min(len(ps) for ps in payload_sets)
-        total = min_len
-        current = 0
-        
-        with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = []
-            
-            for i in range(min_len):
-                if self.stop_flag:
-                    break
-                
-                new_url = template.url
-                new_body = template.body
-                new_headers = dict(template.headers)
-                
-                for pos_index, payload_set in enumerate(payload_sets):
-                    payload = payload_set[i]
-                    new_url = self.replace_position(new_url, pos_index, payload)
-                    new_body = self.replace_position(new_body, pos_index, payload)
-                    new_headers = {k: self.replace_position(v, pos_index, payload) 
-                                   for k, v in new_headers.items()}
-                
-                combined_payload = " | ".join(ps[i] for ps in payload_sets)
-                
-                req = IntruderRequest(
-                    method=template.method,
-                    url=new_url,
-                    headers=new_headers,
-                    body=new_body,
-                    timeout=template.timeout,
-                    verify_ssl=template.verify_ssl
-                )
-                
-                futures.append(executor.submit(self._send_request, req, combined_payload, -1))
-            
-            for future in as_completed(futures):
-                if self.stop_flag:
-                    break
-                result = future.result()
-                self.results.append(result)
-                current += 1
-        
-        return self.results
-    
-    def attack_cluster_bomb(self, template: IntruderRequest, payload_sets: List[List[str]]) -> List[IntruderResult]:
-        """Cluster Bomb - all combinations"""
-        self.results = []
-        self.stop_flag = False
-        
-        combinations = list(product(*payload_sets))
-        total = len(combinations)
-        current = 0
-        
-        with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = []
-            
-            for combo in combinations:
-                if self.stop_flag:
-                    break
-                
-                new_url = template.url
-                new_body = template.body
-                new_headers = dict(template.headers)
-                
-                for pos_index, payload in enumerate(combo):
-                    new_url = self.replace_position(new_url, pos_index, payload)
-                    new_body = self.replace_position(new_body, pos_index, payload)
-                    new_headers = {k: self.replace_position(v, pos_index, payload) 
-                                   for k, v in new_headers.items()}
-                
-                combined_payload = " | ".join(combo)
-                
-                req = IntruderRequest(
-                    method=template.method,
-                    url=new_url,
-                    headers=new_headers,
-                    body=new_body,
-                    timeout=template.timeout,
-                    verify_ssl=template.verify_ssl
-                )
-                
-                futures.append(executor.submit(self._send_request, req, combined_payload, -1))
-            
-            for future in as_completed(futures):
-                if self.stop_flag:
-                    break
-                result = future.result()
-                self.results.append(result)
-                current += 1
+            for f in futures:
+                if not self.stop_flag:
+                    self.results.append(f.result())
         
         return self.results
     
     def stop(self):
-        """Stop the attack"""
         self.stop_flag = True
-    
-    def get_results(self) -> List[IntruderResult]:
-        return self.results
-    
-    def get_results_summary(self) -> Dict[str, Any]:
-        """Get summary of results"""
-        if not self.results:
-            return {}
-        
-        status_codes = {}
-        lengths = []
-        times = []
-        errors = 0
-        
-        for r in self.results:
-            if r.error:
-                errors += 1
-            else:
-                status_codes[r.status_code] = status_codes.get(r.status_code, 0) + 1
-                lengths.append(r.response_length)
-                times.append(r.elapsed_time)
-        
-        return {
-            "total_requests": len(self.results),
-            "errors": errors,
-            "status_codes": status_codes,
-            "avg_length": sum(lengths) / len(lengths) if lengths else 0,
-            "avg_time": sum(times) / len(times) if times else 0,
-            "min_length": min(lengths) if lengths else 0,
-            "max_length": max(lengths) if lengths else 0
-        }
-    
-    def filter_results(self, status_code: int = None, min_length: int = None, 
-                       max_length: int = None, contains: str = None) -> List[IntruderResult]:
-        """Filter results"""
-        filtered = self.results
-        
-        if status_code:
-            filtered = [r for r in filtered if r.status_code == status_code]
-        if min_length:
-            filtered = [r for r in filtered if r.response_length >= min_length]
-        if max_length:
-            filtered = [r for r in filtered if r.response_length <= max_length]
-        if contains:
-            filtered = [r for r in filtered if contains in r.response_body]
-        
-        return filtered
 
-# =============================================================================
-# MITMPROXY ADDONS
-# =============================================================================
-if MITMPROXY_AVAILABLE:
-    class InterceptModeAddon:
-        """Interactive intercept mode - allows Allow/Drop/Edit from terminal"""
-        
-        def __init__(self):
-            self.enabled = True
-            self.excluded_hosts = [
-                "127.0.0.1",
-                "localhost",
-                "0.0.0.0",
-            ]
-            self.excluded_ports = [
-                5050,  # Dashboard port
-            ]
-            self.excluded_patterns = [
-                r"/api/traffic",
-                r"/api/request/",
-                r"/api/response/",
-                r"/api/clear-requests",
-                r"/api/repeater/",
-                r"/api/intruder/",
-                r"/ws/terminal",
-                r"/ws/intruder",
-            ]
-        
-        def should_intercept(self, flow: http.HTTPFlow) -> bool:
-            host = flow.request.host
-            port = flow.request.port
-            path = flow.request.path
-            
-            if host in self.excluded_hosts:
-                return False
-            if port in self.excluded_ports:
-                return False
-            for pattern in self.excluded_patterns:
-                if re.search(pattern, path):
-                    return False
-            return True
-        
-        def request(self, flow: http.HTTPFlow):
-            if not self.enabled:
-                return
-            
-            if not self.should_intercept(flow):
-                return
-            
-            print("\n" + "=" * 50)
-            print(" INTERCEPTED REQUEST ")
-            print("=" * 50)
-            print(f"URL     : {flow.request.url}")
-            print(f"METHOD  : {flow.request.method}")
-            print("HEADERS :")
-            for k, v in flow.request.headers.items():
-                print(f"   {k}: {v}")
-            
-            if flow.request.text:
-                print("\nBODY:")
-                print(flow.request.text)
-            
-            print("\n" + "=" * 50)
-            print("[A] Allow")
-            print("[D] Drop")
-            print("[E] Edit request")
-            print("[S] Skip (auto-allow all from this host)")
-            print("=" * 50)
-            
-            try:
-                choice = input("Your action: ").strip().lower()
-                
-                if choice == "a":
-                    print("Request forwarded.")
-                    return
-                elif choice == "d":
-                    print("Request dropped.")
-                    flow.response = http.Response.make(403, b"Request Dropped by Proxy")
-                    return
-                elif choice == "e":
-                    print("\n--- Edit Mode ---")
-                    new_url = input("New URL (press Enter to keep): ").strip()
-                    if new_url:
-                        flow.request.url = new_url
-                    new_body = input("New Body (press Enter to keep): ").strip()
-                    if new_body:
-                        flow.request.text = new_body
-                    print("Request after editing will be forwarded.")
-                    return
-                elif choice == "s":
-                    self.excluded_hosts.append(flow.request.host)
-                    print(f"Added {flow.request.host} to excluded hosts.")
-                    return
-                else:
-                    print("Invalid choice - auto forward.")
-                    return
-            except EOFError:
-                # Handle non-interactive mode
-                print("Running in non-interactive mode - auto forwarding.")
-                return
-    
-    class ProxyLoggerAddon:
-        """Logs all traffic to SQLite database"""
-        
-        def __init__(self):
-            self.method = None
-            self.url = None
-            self.req_headers = None
-            self.req_body = None
-        
-        def request(self, flow: http.HTTPFlow):
-            self.method = flow.request.method
-            self.url = flow.request.url
-            self.req_headers = json.dumps(dict(flow.request.headers), ensure_ascii=False)
-            self.req_body = flow.request.text if flow.request.text else ""
-        
-        def response(self, flow: http.HTTPFlow):
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("""
-                INSERT INTO history (method, url, status_code, request_headers, 
-                                     request_body, response_headers, response_body, time)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                self.method,
-                self.url,
-                flow.response.status_code,
-                self.req_headers,
-                self.req_body,
-                json.dumps(dict(flow.response.headers), ensure_ascii=False),
-                flow.response.text if flow.response.text else "",
-                str(datetime.datetime.now())
-            ))
-            conn.commit()
-            conn.close()
-    
-    class InterceptAddon:
-        """Basic request/response interceptor"""
-        
-        def request(self, flow: http.HTTPFlow):
-            print(f"[REQUEST] {flow.request.method} {flow.request.url}")
-            flow.request.headers["X-Proxy-Intercept"] = "RedKit-Proxy"
-        
-        def response(self, flow: http.HTTPFlow):
-            print(f"[RESPONSE] {flow.response.status_code} from {flow.request.url}")
-    
-    class RewriteEngineAddon:
-        """URL/Header/Body rewrite engine"""
-        
-        def __init__(self):
-            self.rules = []
-            self._load_rules()
-        
-        def _load_rules(self):
-            try:
-                with open("rewrite_rules.json", "r") as f:
-                    self.rules = json.load(f)
-            except FileNotFoundError:
-                self.rules = []
-        
-        def request(self, flow: http.HTTPFlow):
-            url = flow.request.url
-            
-            for rule in self.rules:
-                if rule.get("match", "") in url:
-                    if "replace_url" in rule:
-                        print(f"[Rewrite] URL → {rule['replace_url']}")
-                        flow.request.url = rule["replace_url"]
-                    
-                    if "replace_header" in rule:
-                        for k, v in rule["replace_header"].items():
-                            print(f"[Rewrite] Header {k} → {v}")
-                            flow.request.headers[k] = v
-                    
-                    if "replace_body" in rule:
-                        print("[Rewrite] Body replaced")
-                        flow.request.text = rule["replace_body"]
-        
-        def response(self, flow: http.HTTPFlow):
-            url = flow.request.url
-            
-            for rule in self.rules:
-                if rule.get("match", "") in url:
-                    if "replace_response_body" in rule:
-                        print("[Rewrite] Response Body replaced")
-                        flow.response.text = rule["replace_response_body"]
-    
-    # Expose addons for mitmproxy
-    addons = [
-        InterceptModeAddon(),  # Interactive intercept (Allow/Drop/Edit)
-        ProxyLoggerAddon(),     # Log to database
-        InterceptAddon(),       # Basic logging
-        RewriteEngineAddon()    # URL/Header/Body rewrite rules
-    ]
+# Global state for WebSocket broadcasting
+active_websockets = []
+intercept_enabled = False
 
-# =============================================================================
-# FASTAPI APPLICATION
-# =============================================================================
-app = FastAPI(title="RedKit Proxy Dashboard", version="3.0")
+# FastAPI App
+app = FastAPI(title="RedKit Proxy WebSocket", version="4.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# Enable CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Global instances
-repeater_instance = Repeater()
 intruder_instance = Intruder(threads=10)
 
-# =============================================================================
-# PYDANTIC MODELS
-# =============================================================================
-class RepeaterSendRequest(BaseModel):
-    method: str
-    url: str
-    headers: Dict[str, str] = {}
-    body: str = ""
-    timeout: int = 30
-    follow_redirects: bool = True
-    verify_ssl: bool = False
-
-class RepeaterFromHistoryRequest(BaseModel):
-    history_id: int
-
-class RepeaterRawRequest(BaseModel):
-    raw_request: str
-    target_host: str
-    use_https: bool = True
-
-class IntruderAttackRequest(BaseModel):
-    method: str
-    url: str
-    headers: Dict[str, str] = {}
-    body: str = ""
-    attack_type: str = "sniper"
-    payloads: List[str] = []
-    payload_sets: List[List[str]] = []
-    threads: int = 10
-    timeout: int = 30
-
-class IntruderPayloadRequest(BaseModel):
-    payload_type: str
-    start: int = 0
-    end: int = 100
-    step: int = 1
-    filepath: str = ""
-
-# =============================================================================
-# DATABASE HELPERS
-# =============================================================================
-def fetch_all_requests():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT id, method, url, status_code, time FROM history ORDER BY id DESC")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-def fetch_request(req_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT method, url, request_headers, request_body, time FROM history WHERE id = ?", (req_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-def fetch_response(req_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT status_code, response_headers, response_body FROM history WHERE id = ?", (req_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-# =============================================================================
-# TRAFFIC ENDPOINTS
-# =============================================================================
-@app.get("/api/traffic")
-def api_traffic():
-    return JSONResponse({"data": fetch_all_requests()})
-
-@app.get("/api/request/{req_id}")
-def api_request(req_id: int):
-    data = fetch_request(req_id)
-    return JSONResponse({"data": data})
-
-@app.get("/api/response/{req_id}")
-def api_response(req_id: int):
-    data = fetch_response(req_id)
-    return JSONResponse({"data": data})
-
-@app.delete("/api/clear-requests")
-def clear_requests():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM history")
-    conn.commit()
-    conn.close()
-    return JSONResponse({"message": "All requests cleared"})
-
-# =============================================================================
-# REPEATER ENDPOINTS
-# =============================================================================
-@app.post("/api/repeater/send")
-def repeater_send(req: RepeaterSendRequest):
-    try:
-        print(f"[Repeater] Sending {req.method} to {req.url}")
-        
-        repeater_req = RepeaterRequest(
-            method=req.method,
-            url=req.url,
-            headers=req.headers,
-            body=req.body,
-            timeout=req.timeout,
-            follow_redirects=req.follow_redirects,
-            verify_ssl=req.verify_ssl
-        )
-        
-        response = repeater_instance.send(repeater_req)
-        
-        print(f"[Repeater] Response: {response.status_code}, Error: {response.error}")
-        
-        return JSONResponse({
-            "success": response.error is None,
-            "data": {
-                "status_code": response.status_code,
-                "headers": response.headers,
-                "body": response.body,
-                "elapsed_time": response.elapsed_time,
-                "size": response.size,
-                "error": response.error
-            }
-        })
-    except Exception as e:
-        print(f"[Repeater] Exception: {str(e)}")
-        return JSONResponse({
-            "success": False,
-            "data": {
-                "status_code": 0,
-                "headers": {},
-                "body": "",
-                "elapsed_time": 0,
-                "size": 0,
-                "error": str(e)
-            }
-        })
-
-@app.post("/api/repeater/send-from-history")
-def repeater_send_from_history(req: RepeaterFromHistoryRequest):
-    response = send_from_history(req.history_id, DB_FILE)
+# Connection Manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
     
-    return JSONResponse({
-        "success": response.error is None,
-        "data": {
-            "status_code": response.status_code,
-            "headers": response.headers,
-            "body": response.body,
-            "elapsed_time": response.elapsed_time,
-            "size": response.size,
-            "error": response.error
-        }
-    })
-
-@app.post("/api/repeater/send-raw")
-def repeater_send_raw(req: RepeaterRawRequest):
-    response = repeater_instance.send_raw(req.raw_request, req.target_host, req.use_https)
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        active_websockets.append(websocket)
     
-    return JSONResponse({
-        "success": response.error is None,
-        "data": {
-            "status_code": response.status_code,
-            "headers": response.headers,
-            "body": response.body,
-            "elapsed_time": response.elapsed_time,
-            "size": response.size,
-            "error": response.error
-        }
-    })
-
-@app.get("/api/repeater/history")
-def repeater_history():
-    return JSONResponse({"data": repeater_instance.get_history()})
-
-@app.delete("/api/repeater/clear-history")
-def repeater_clear_history():
-    repeater_instance.clear_history()
-    return JSONResponse({"message": "Repeater history cleared"})
-
-# =============================================================================
-# INTRUDER ENDPOINTS
-# =============================================================================
-@app.post("/api/intruder/attack")
-async def intruder_attack(req: IntruderAttackRequest, background_tasks: BackgroundTasks):
-    global intruder_instance
-    intruder_instance = Intruder(threads=req.threads)
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+        if websocket in active_websockets:
+            active_websockets.remove(websocket)
     
-    template = IntruderRequest(
-        method=req.method,
-        url=req.url,
-        headers=req.headers,
-        body=req.body,
-        timeout=req.timeout
-    )
-    
-    attack_type = req.attack_type.lower()
-    
-    if attack_type == "sniper":
-        results = intruder_instance.attack_sniper(template, req.payloads)
-    elif attack_type == "battering_ram":
-        results = intruder_instance.attack_battering_ram(template, req.payloads)
-    elif attack_type == "pitchfork":
-        results = intruder_instance.attack_pitchfork(template, req.payload_sets)
-    elif attack_type == "cluster_bomb":
-        results = intruder_instance.attack_cluster_bomb(template, req.payload_sets)
-    else:
-        return JSONResponse({"error": f"Unknown attack type: {attack_type}"}, status_code=400)
-    
-    results_data = []
-    for r in results:
-        results_data.append({
-            "payload": r.payload,
-            "position": r.payload_position,
-            "status_code": r.status_code,
-            "length": r.response_length,
-            "time": r.elapsed_time,
-            "error": r.error
-        })
-    
-    summary = intruder_instance.get_results_summary()
-    
-    return JSONResponse({
-        "success": True,
-        "total_requests": len(results),
-        "summary": summary,
-        "results": results_data
-    })
-
-@app.get("/api/intruder/results")
-def intruder_results():
-    results = intruder_instance.get_results()
-    
-    results_data = []
-    for r in results:
-        results_data.append({
-            "payload": r.payload,
-            "position": r.payload_position,
-            "status_code": r.status_code,
-            "length": r.response_length,
-            "time": r.elapsed_time,
-            "error": r.error,
-            "response_body": r.response_body[:500] if r.response_body else ""
-        })
-    
-    return JSONResponse({
-        "total": len(results),
-        "summary": intruder_instance.get_results_summary(),
-        "results": results_data
-    })
-
-@app.get("/api/intruder/result/{index}")
-def intruder_result_detail(index: int):
-    results = intruder_instance.get_results()
-    
-    if index < 0 or index >= len(results):
-        return JSONResponse({"error": "Index out of range"}, status_code=404)
-    
-    r = results[index]
-    return JSONResponse({
-        "payload": r.payload,
-        "position": r.payload_position,
-        "status_code": r.status_code,
-        "length": r.response_length,
-        "time": r.elapsed_time,
-        "error": r.error,
-        "response_body": r.response_body,
-        "response_headers": r.response_headers
-    })
-
-@app.post("/api/intruder/stop")
-def intruder_stop():
-    intruder_instance.stop()
-    return JSONResponse({"message": "Attack stopped"})
-
-@app.post("/api/intruder/payloads/generate")
-def intruder_generate_payloads(req: IntruderPayloadRequest):
-    payload_type = req.payload_type.lower()
-    
-    if payload_type == "passwords":
-        payloads = PayloadGenerator.common_passwords()
-    elif payload_type == "usernames":
-        payloads = PayloadGenerator.common_usernames()
-    elif payload_type == "sqli":
-        payloads = PayloadGenerator.sqli_payloads()
-    elif payload_type == "xss":
-        payloads = PayloadGenerator.xss_payloads()
-    elif payload_type == "path_traversal":
-        payloads = PayloadGenerator.path_traversal_payloads()
-    elif payload_type == "numbers":
-        payloads = PayloadGenerator.numbers(req.start, req.end, req.step)
-    elif payload_type == "file":
+    async def send_personal_message(self, message: dict, websocket: WebSocket):
         try:
-            payloads = PayloadGenerator.from_file(req.filepath)
-        except Exception as e:
-            return JSONResponse({"error": str(e)}, status_code=400)
-    else:
-        return JSONResponse({"error": f"Unknown payload type: {payload_type}"}, status_code=400)
+            await websocket.send_json(message)
+        except:
+            pass
     
-    return JSONResponse({
-        "type": payload_type,
-        "count": len(payloads),
-        "payloads": payloads
-    })
-
-@app.get("/api/intruder/payloads/types")
-def intruder_payload_types():
-    return JSONResponse({
-        "types": [
-            {"id": "passwords", "name": "Common Passwords", "count": len(PayloadGenerator.common_passwords())},
-            {"id": "usernames", "name": "Common Usernames", "count": len(PayloadGenerator.common_usernames())},
-            {"id": "sqli", "name": "SQL Injection", "count": len(PayloadGenerator.sqli_payloads())},
-            {"id": "xss", "name": "XSS Payloads", "count": len(PayloadGenerator.xss_payloads())},
-            {"id": "path_traversal", "name": "Path Traversal", "count": len(PayloadGenerator.path_traversal_payloads())},
-            {"id": "numbers", "name": "Number Range", "count": "dynamic"},
-            {"id": "file", "name": "From File", "count": "dynamic"}
-        ]
-    })
-
-@app.post("/api/intruder/filter")
-def intruder_filter_results(
-    status_code: int = None,
-    min_length: int = None,
-    max_length: int = None,
-    contains: str = None
-):
-    filtered = intruder_instance.filter_results(
-        status_code=status_code,
-        min_length=min_length,
-        max_length=max_length,
-        contains=contains
-    )
-    
-    results_data = []
-    for r in filtered:
-        results_data.append({
-            "payload": r.payload,
-            "status_code": r.status_code,
-            "length": r.response_length,
-            "time": r.elapsed_time
-        })
-    
-    return JSONResponse({
-        "filtered_count": len(filtered),
-        "results": results_data
-    })
-
-# =============================================================================
-# WEBSOCKET ENDPOINTS
-# =============================================================================
-@app.websocket("/ws/intruder")
-async def websocket_intruder(ws: WebSocket):
-    await ws.accept()
-    
-    try:
-        while True:
-            results = intruder_instance.get_results()
-            summary = intruder_instance.get_results_summary()
-            
-            await ws.send_json({
-                "total": len(results),
-                "summary": summary,
-                "latest": [
-                    {
-                        "payload": r.payload,
-                        "status_code": r.status_code,
-                        "length": r.response_length
-                    } for r in results[-10:]
-                ]
-            })
-            
-            await asyncio.sleep(1)
-            
-    except Exception:
-        pass
-
-@app.websocket("/ws/terminal")
-async def websocket_terminal(ws: WebSocket):
-    await ws.accept()
-    await ws.send_text("Connected to RedKit Terminal\n$ ")
-    
-    try:
-        while True:
-            cmd = await ws.receive_text()
-            cmd = cmd.strip()
-            
-            if cmd == "":
-                await ws.send_text("$ ")
-                continue
-            
+    async def broadcast(self, message: dict):
+        for connection in list(self.active_connections):
             try:
-                process = subprocess.Popen(
-                    shlex.split(cmd),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                stdout, stderr = process.communicate()
-                
-                output = stdout
-                if stderr:
-                    output += "\n" + stderr
-                
-            except Exception as e:
-                output = f"Error executing command: {str(e)}"
-            
-            await ws.send_text(output + "\n$ ")
-            
-    except Exception:
-        pass
+                await connection.send_json(message)
+            except:
+                pass
 
-# =============================================================================
-# FRONTEND ROUTE
-# =============================================================================
-@app.get("/", response_class=HTMLResponse)
+manager = ConnectionManager()
+
+# Database helpers
+def save_to_history(method, url, status_code, req_headers, req_body, resp_headers, resp_body):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT INTO history (method, url, status_code, request_headers, request_body, response_headers, response_body, time) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 (method, url, status_code, req_headers, req_body, resp_headers, resp_body, str(datetime.datetime.now())))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error saving to history: {e}")
+
+# Track notified requests in memory to avoid duplicates within the same session
+notified_requests = set()
+
+# Background task to poll for new intercepts and notify clients
+async def poll_intercepts():
+    """Background task to check for new intercepts and notify WebSocket clients"""
+    while True:
+        try:
+            await asyncio.sleep(0.3)
+            
+            # Check for pending intercepts that haven't been notified
+            pending = get_pending_intercepts()
+            
+            # Notify all connected clients about new pending intercepts
+            for row in pending:
+                req_id, method, url, host, headers, body, raw_request = row
+                
+                # Skip if already notified in this session
+                if req_id in notified_requests:
+                    continue
+                
+                # Mark as notified in database and memory
+                mark_intercept_notified(req_id)
+                notified_requests.add(req_id)
+                
+                # Notify all connected WebSocket clients
+                for ws in list(active_websockets):
+                    try:
+                        await manager.send_personal_message({
+                            'type': 'intercepted_request',
+                            'id': req_id,
+                            'method': method,
+                            'url': url,
+                            'host': host,
+                            'headers': headers,
+                            'body': body,
+                            'raw': raw_request
+                        }, ws)
+                    except:
+                        pass
+                        
+        except Exception as e:
+            print(f"Error in poll_intercepts: {e}")
+
+# Start background task
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(poll_intercepts())
+
+# Main WebSocket endpoint
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    
+    try:
+        while True:
+            data = await websocket.receive_json()
+            action = data.get('action')
+            
+            # INTERCEPTOR ACTIONS
+            if action == 'toggle_intercept':
+                global intercept_enabled
+                intercept_enabled = data.get('enabled', False)
+                set_intercept_enabled(intercept_enabled)
+                await manager.send_personal_message({'type': 'intercept_status', 'enabled': intercept_enabled}, websocket)
+            
+            elif action == 'forward_request':
+                req_id = data.get('id')
+                modified = data.get('request', {})
+                update_intercept_status(req_id, 'forward', modified)
+                await manager.send_personal_message({'type': 'forwarded', 'id': req_id}, websocket)
+            
+            elif action == 'drop_request':
+                req_id = data.get('id')
+                update_intercept_status(req_id, 'drop')
+                await manager.send_personal_message({'type': 'dropped', 'id': req_id}, websocket)
+            
+            elif action == 'forward_all':
+                requests_list = data.get('requests', [])
+                for req in requests_list:
+                    req_id = req.get('id')
+                    update_intercept_status(req_id, 'forward', req)
+                await manager.send_personal_message({'type': 'queue_cleared'}, websocket)
+            
+            elif action == 'drop_all':
+                ids = data.get('ids', [])
+                for req_id in ids:
+                    update_intercept_status(req_id, 'drop')
+                await manager.send_personal_message({'type': 'queue_cleared'}, websocket)
+            
+            # HISTORY ACTIONS
+            elif action == 'get_history':
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("SELECT id, method, url, status_code, time FROM history ORDER BY id DESC LIMIT 100")
+                rows = c.fetchall()
+                conn.close()
+                await manager.send_personal_message({'type': 'history', 'data': rows}, websocket)
+            
+            elif action == 'get_history_detail':
+                req_id = data.get('id')
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("SELECT request_headers, request_body, response_headers, response_body FROM history WHERE id = ?", (req_id,))
+                row = c.fetchone()
+                conn.close()
+                if row:
+                    await manager.send_personal_message({
+                        'type': 'history_detail',
+                        'request_headers': row[0],
+                        'request_body': row[1],
+                        'response_headers': row[2],
+                        'response_body': row[3]
+                    }, websocket)
+            
+            elif action == 'clear_history':
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("DELETE FROM history")
+                conn.commit()
+                conn.close()
+                await manager.send_personal_message({'type': 'history_cleared'}, websocket)
+            
+            # REPEATER ACTIONS
+            elif action == 'repeater_send':
+                req_data = data.get('request', {})
+                start = time.time()
+                try:
+                    resp = requests.request(
+                        method=req_data.get('method', 'GET').upper(),
+                        url=req_data.get('url', ''),
+                        headers=req_data.get('headers', {}),
+                        data=req_data.get('body') if req_data.get('body') else None,
+                        timeout=req_data.get('timeout', 30),
+                        allow_redirects=req_data.get('follow_redirects', True),
+                        verify=False
+                    )
+                    await manager.send_personal_message({
+                        'type': 'repeater_response',
+                        'success': True,
+                        'data': {
+                            'status_code': resp.status_code,
+                            'headers': dict(resp.headers),
+                            'body': resp.text,
+                            'elapsed_time': round(time.time() - start, 3),
+                            'size': len(resp.content)
+                        }
+                    }, websocket)
+                except Exception as e:
+                    await manager.send_personal_message({
+                        'type': 'repeater_response',
+                        'success': False,
+                        'error': str(e)
+                    }, websocket)
+            
+            # INTRUDER ACTIONS
+            elif action == 'intruder_attack':
+                global intruder_instance
+                intruder_instance = Intruder(threads=data.get('threads', 10))
+                template = {
+                    'method': data.get('method', 'GET'),
+                    'url': data.get('url', ''),
+                    'headers': data.get('headers', {}),
+                    'body': data.get('body', ''),
+                    'timeout': data.get('timeout', 30)
+                }
+                attack_type = data.get('attack_type', 'sniper')
+                payloads = data.get('payloads', [])
+                
+                if attack_type == 'sniper':
+                    results = intruder_instance.attack_sniper(template, payloads)
+                elif attack_type == 'battering_ram':
+                    results = intruder_instance.attack_battering_ram(template, payloads)
+                else:
+                    results = intruder_instance.attack_sniper(template, payloads)
+                
+                await manager.send_personal_message({
+                    'type': 'intruder_results',
+                    'total': len(results),
+                    'results': results
+                }, websocket)
+            
+            elif action == 'intruder_stop':
+                intruder_instance.stop()
+                await manager.send_personal_message({'type': 'intruder_stopped'}, websocket)
+            
+            elif action == 'get_payloads':
+                payload_type = data.get('payload_type', 'passwords')
+                if payload_type == 'passwords':
+                    payloads = PayloadGenerator.common_passwords()
+                elif payload_type == 'usernames':
+                    payloads = PayloadGenerator.common_usernames()
+                elif payload_type == 'sqli':
+                    payloads = PayloadGenerator.sqli_payloads()
+                elif payload_type == 'xss':
+                    payloads = PayloadGenerator.xss_payloads()
+                elif payload_type == 'path_traversal':
+                    payloads = PayloadGenerator.path_traversal_payloads()
+                elif payload_type == 'numbers':
+                    payloads = PayloadGenerator.numbers(data.get('start', 0), data.get('end', 100), data.get('step', 1))
+                else:
+                    payloads = []
+                
+                await manager.send_personal_message({
+                    'type': 'payloads',
+                    'payload_type': payload_type,
+                    'payloads': payloads
+                }, websocket)
+            
+            # Unknown action
+            else:
+                await manager.send_personal_message({'type': 'error', 'message': f'Unknown action: {action}'}, websocket)
+                
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        manager.disconnect(websocket)
+
+# Serve frontend
+@app.get("/")
 def dashboard():
     try:
         with open("index.html", "r", encoding="utf-8") as f:
-            return f.read()
+            return HTMLResponse(content=f.read())
     except FileNotFoundError:
-        return """
-        <html>
-        <head><title>RedKit Proxy</title></head>
-        <body style="background:#0f0f0f;color:#e5e5e5;font-family:monospace;padding:40px;">
-            <h1>RedKit Proxy Dashboard</h1>
-            <p style="color:#ef4444;">index.html not found!</p>
-            <p>Please make sure index.html is in the same directory as backend.py</p>
-            <h2>API is still running. Available Endpoints:</h2>
-            <ul>
-                <li><a href="/docs" style="color:#3b82f6;">/docs</a> - API Documentation</li>
-                <li>/api/traffic - Get all traffic</li>
-                <li>/api/repeater/send - Send request via Repeater</li>
-                <li>/api/intruder/attack - Start Intruder attack</li>
-            </ul>
-        </body>
-        </html>
-        """
+        return HTMLResponse(content="<h1>index.html not found</h1>")
 
-# =============================================================================
-# MAIN
-# =============================================================================
+# Mitmproxy Addons
+if MITMPROXY_AVAILABLE:
+    class GUIInterceptAddon:
+        """Intercept addon that queues requests for GUI approval via SQLite"""
+        
+        def __init__(self):
+            self.excluded_hosts = ["127.0.0.1", "localhost", "0.0.0.0"]
+            self.excluded_ports = [5050]
+            self.excluded_patterns = [r"/ws"]
+        
+        def should_intercept(self, flow):
+            if flow.request.host in self.excluded_hosts:
+                return False
+            if flow.request.port in self.excluded_ports:
+                return False
+            for pattern in self.excluded_patterns:
+                if re.search(pattern, flow.request.path):
+                    return False
+            return True
+        
+        def request(self, flow):
+            # Check if intercept is enabled via database (IPC)
+            if not is_intercept_enabled() or not self.should_intercept(flow):
+                return
+            
+            # Generate unique ID
+            req_id = str(uuid.uuid4())
+            
+            # Build raw request
+            raw_request = f"{flow.request.method} {flow.request.path} HTTP/1.1\n"
+            headers_dict = dict(flow.request.headers)
+            headers_str = ""
+            for k, v in headers_dict.items():
+                raw_request += f"{k}: {v}\n"
+                headers_str += f"{k}: {v}\n"
+            body = flow.request.text if flow.request.text else ""
+            if body:
+                raw_request += f"\n{body}"
+            
+            # Add to database queue
+            add_to_intercept_queue(
+                req_id, 
+                flow.request.method, 
+                flow.request.url, 
+                flow.request.host,
+                headers_str, 
+                body, 
+                raw_request
+            )
+            
+            # Wait for user action (poll database)
+            timeout = 300  # 5 minutes
+            waited = 0
+            while waited < timeout:
+                status_row = get_intercept_status(req_id)
+                if status_row and status_row[0] != 'pending':
+                    break
+                time.sleep(0.1)
+                waited += 0.1
+            
+            # Get final status
+            status_row = get_intercept_status(req_id)
+            action = status_row[0] if status_row else 'forward'
+            
+            if action == 'drop':
+                flow.response = http.Response.make(403, b"Request Dropped by Interceptor")
+            elif action == 'forward':
+                # Apply any modifications
+                if status_row:
+                    mod_method, mod_url, mod_headers, mod_body = status_row[1], status_row[2], status_row[3], status_row[4]
+                    if mod_method:
+                        flow.request.method = mod_method
+                    if mod_url:
+                        flow.request.url = mod_url
+                    if mod_headers:
+                        # Parse headers
+                        new_headers = {}
+                        for line in mod_headers.split('\n'):
+                            if ':' in line:
+                                k, v = line.split(':', 1)
+                                new_headers[k.strip()] = v.strip()
+                        flow.request.headers.clear()
+                        for k, v in new_headers.items():
+                            flow.request.headers[k] = v
+                    if mod_body is not None:
+                        flow.request.text = mod_body
+            
+            # Clean up
+            remove_from_intercept_queue(req_id)
+        
+        def response(self, flow):
+            # Save to history
+            try:
+                save_to_history(
+                    flow.request.method,
+                    flow.request.url,
+                    flow.response.status_code,
+                    json.dumps(dict(flow.request.headers), ensure_ascii=False),
+                    flow.request.text if flow.request.text else "",
+                    json.dumps(dict(flow.response.headers), ensure_ascii=False),
+                    flow.response.text if flow.response.text else ""
+                )
+            except Exception as e:
+                print(f"Error saving to history: {e}")
+    
+    addons = [GUIInterceptAddon()]
+
 if __name__ == "__main__":
     print("=" * 60)
-    print("  RedKit Proxy Dashboard v3.0")
+    print("  RedKit Proxy WebSocket v4.0 - GUI Interceptor")
     print("=" * 60)
-    print("\n[+] Starting API server on http://0.0.0.0:5050")
-    print("[+] Features: Proxy, Repeater, Intruder, Terminal")
-    print("[+] Database: proxy_history.db")
-    print("\n[!] To capture traffic, run mitmproxy with:")
-    print("    mitmdump -s backend.py -p 8080")
-    print("\n[*] Dashboard available at: http://localhost:5050")
+    print("\n[+] Starting WebSocket server on ws://0.0.0.0:5050/ws")
+    print("[+] Dashboard: http://localhost:5050")
+    print("[+] Features: Interceptor, HTTP History, Repeater, Intruder")
+    print("\n[!] For intercept mode: mitmdump -s backend.py -p 8080")
     print("=" * 60 + "\n")
-    
     uvicorn.run(app, host="0.0.0.0", port=5050)
