@@ -119,6 +119,9 @@
                     <button onclick="toggleIntercept()" id="intercept-toggle-btn" class="btn-action btn-intercept-toggle">
                         Intercept is OFF
                     </button>
+                    <button onclick="toggleResponseIntercept()" id="response-intercept-toggle-btn" class="btn-action btn-intercept-toggle">
+                        Response Intercept is OFF
+                    </button>
                     <span id="intercept-status" class="text-sm text-gray-400 ml-2"></span>
                 </div>
                 <div class="flex gap-2">
@@ -355,6 +358,7 @@ let intruderResults = [];
 
 // Interceptor state
 let interceptEnabled = false;
+let responseInterceptEnabled = false;
 let interceptQueue = [];
 let selectedInterceptIndex = -1;
 
@@ -436,7 +440,8 @@ function handleWebSocketMessage(msg) {
             host: msg.host,
             headers: msg.headers,
             body: msg.body,
-            raw: msg.raw
+            raw: msg.raw,
+            itemType: 'request'
         });
         updateInterceptTable();
         
@@ -446,6 +451,42 @@ function handleWebSocketMessage(msg) {
             selectInterceptRequest(selectedInterceptIndex);
             
             // Auto-scroll to show the selected request
+            setTimeout(() => {
+                const tableContainer = document.querySelector('.top-pane');
+                if (tableContainer) {
+                    tableContainer.scrollTop = tableContainer.scrollHeight;
+                }
+            }, 100);
+        }
+    }
+    else if (type === 'intercepted_response') {
+        // Check if this response is already in the queue (avoid duplicates)
+        const existingIndex = interceptQueue.findIndex(r => r.id === msg.id);
+        if (existingIndex >= 0) {
+            return; // Already exists, ignore
+        }
+        
+        // Add new response to the END of queue (newest at bottom)
+        interceptQueue.push({
+            id: msg.id,
+            method: msg.method,
+            url: msg.url,
+            host: msg.host,
+            statusCode: msg.status_code,
+            headers: msg.response_headers,
+            body: msg.response_body,
+            raw: msg.raw_response,
+            itemType: 'response',
+            parentId: msg.parent_id
+        });
+        updateInterceptTable();
+        
+        // Auto-select the newest response if nothing is selected
+        if (selectedInterceptIndex === -1) {
+            selectedInterceptIndex = interceptQueue.length - 1;
+            selectInterceptRequest(selectedInterceptIndex);
+            
+            // Auto-scroll to show the selected response
             setTimeout(() => {
                 const tableContainer = document.querySelector('.top-pane');
                 if (tableContainer) {
@@ -552,14 +593,36 @@ function toggleIntercept() {
     if (interceptEnabled) {
         btn.innerHTML = 'Intercept is ON';
         btn.classList.add('active');
-        indicator.innerHTML = '<span class="intercepting text-green-500">Intercepting...</span>';
+        indicator.innerHTML = '<span class="intercepting text-green-500">Intercepting Requests...</span>';
     } else {
         btn.innerHTML = 'Intercept is OFF';
         btn.classList.remove('active');
-        indicator.innerHTML = '';
+        if (!responseInterceptEnabled) {
+            indicator.innerHTML = '';
+        }
     }
     
     sendMessage({action: 'toggle_intercept', enabled: interceptEnabled});
+}
+
+function toggleResponseIntercept() {
+    responseInterceptEnabled = !responseInterceptEnabled;
+    const btn = document.getElementById('response-intercept-toggle-btn');
+    const indicator = document.getElementById('intercept-status');
+    
+    if (responseInterceptEnabled) {
+        btn.innerHTML = 'Response Intercept is ON';
+        btn.classList.add('active');
+        indicator.innerHTML = '<span class="intercepting text-blue-500">Intercepting Responses...</span>';
+    } else {
+        btn.innerHTML = 'Response Intercept is OFF';
+        btn.classList.remove('active');
+        if (!interceptEnabled) {
+            indicator.innerHTML = '';
+        }
+    }
+    
+    sendMessage({action: 'toggle_response_intercept', enabled: responseInterceptEnabled});
 }
 
 function updateInterceptTable() {
@@ -593,15 +656,30 @@ function updateInterceptTable() {
         const displayUrl = url.pathname + url.search;
         const truncatedUrl = displayUrl.length > 50 ? displayUrl.substring(0, 50) + '...' : displayUrl;
         
+        // Check if it's a response
+        const isResponse = req.itemType === 'response';
+        const rowClass = isResponse ? 'bg-blue-900/30' : '';
+        const typeLabel = isResponse ? 'RESPONSE' : 'REQUEST';
+        const statusDisplay = isResponse ? `<span class="badge ${getStatusColor(req.statusCode)}">${req.statusCode || '-'}</span>` : 'Waiting';
+        
         return `
-        <tr class="${index === selectedInterceptIndex ? 'selected' : ''}" onclick="selectInterceptRequest(${index})">
+        <tr class="${index === selectedInterceptIndex ? 'selected' : ''} ${rowClass}" onclick="selectInterceptRequest(${index})">
             <td>${index + 1}</td>
             <td><span class="badge ${getMethodColor(req.method)}">${req.method}</span></td>
             <td>${url.hostname}</td>
             <td class="truncate max-w-xs" title="${displayUrl}">${truncatedUrl}</td>
-            <td>Waiting</td>
+            <td>${typeLabel} ${statusDisplay}</td>
         </tr>
     `}).join('');
+}
+
+function getStatusColor(statusCode) {
+    if (!statusCode) return '';
+    if (statusCode >= 200 && statusCode < 300) return 'status-2xx';
+    if (statusCode >= 300 && statusCode < 400) return 'status-3xx';
+    if (statusCode >= 400 && statusCode < 500) return 'status-4xx';
+    if (statusCode >= 500) return 'status-5xx';
+    return '';
 }
 
 function getMethodColor(method) {
@@ -625,9 +703,20 @@ function selectInterceptRequest(index) {
         return;
     }
     
-    // Build raw request format
-    let raw = req.raw || buildRawRequest(req);
-    document.getElementById('intercept-editor').value = raw;
+    // Update editor title based on type
+    const editorTitle = document.querySelector('#content-interceptor h3');
+    
+    if (req.itemType === 'response') {
+        // It's a response - show response editor
+        if (editorTitle) editorTitle.textContent = 'Response Editor (Raw)';
+        let raw = req.raw || buildRawResponse(req);
+        document.getElementById('intercept-editor').value = raw;
+    } else {
+        // It's a request - show request editor
+        if (editorTitle) editorTitle.textContent = 'Request Editor (Raw)';
+        let raw = req.raw || buildRawRequest(req);
+        document.getElementById('intercept-editor').value = raw;
+    }
     
     updateInterceptTable();
 }
@@ -637,6 +726,8 @@ function clearInterceptEditor() {
     if (editor) {
         editor.value = '';
     }
+    const editorTitle = document.querySelector('#content-interceptor h3');
+    if (editorTitle) editorTitle.textContent = 'Request Editor (Raw)';
 }
 
 function buildRawRequest(req) {
@@ -646,6 +737,15 @@ function buildRawRequest(req) {
     raw += req.headers;
     if (req.body) {
         raw += `\n\n${req.body}`;
+    }
+    return raw;
+}
+
+function buildRawResponse(resp) {
+    let raw = `HTTP/1.1 ${resp.statusCode || 200} OK\n`;
+    raw += resp.headers || '';
+    if (resp.body) {
+        raw += `\n\n${resp.body}`;
     }
     return raw;
 }
@@ -678,25 +778,59 @@ function parseRawRequest(raw) {
     };
 }
 
+function parseRawResponse(raw) {
+    const lines = raw.split('\n');
+    const firstLine = lines[0].trim();
+    // Parse status line: HTTP/1.1 200 OK
+    const statusMatch = firstLine.match(/HTTP\/\d\.\d\s+(\d+)\s+(.*)/);
+    const statusCode = statusMatch ? parseInt(statusMatch[1]) : 200;
+    
+    // Find where body starts
+    let bodyStart = -1;
+    let headers = [];
+    for (let i = 1; i < lines.length; i++) {
+        if (lines[i].trim() === '') {
+            bodyStart = i + 1;
+            break;
+        }
+        headers.push(lines[i]);
+    }
+    
+    const body = bodyStart > 0 ? lines.slice(bodyStart).join('\n') : '';
+    
+    return {
+        statusCode: statusCode,
+        headers: headers.join('\n'),
+        body: body
+    };
+}
+
 function updateInterceptedRequest() {
     if (selectedInterceptIndex < 0 || selectedInterceptIndex >= interceptQueue.length) {
         alert('No request selected');
         return;
     }
     
+    const item = interceptQueue[selectedInterceptIndex];
     const raw = document.getElementById('intercept-editor').value;
-    const parsed = parseRawRequest(raw);
     
-    const req = interceptQueue[selectedInterceptIndex];
-    const url = new URL(req.url);
-    
-    // Reconstruct URL
-    const newUrl = `${url.protocol}//${url.hostname}${parsed.path}`;
-    
-    req.method = parsed.method;
-    req.url = newUrl;
-    req.headers = parsed.headers;
-    req.body = parsed.body;
+    if (item.itemType === 'response') {
+        // Update response
+        const parsed = parseRawResponse(raw);
+        item.statusCode = parsed.statusCode;
+        item.headers = parsed.headers;
+        item.body = parsed.body;
+    } else {
+        // Update request
+        const parsed = parseRawRequest(raw);
+        const url = new URL(item.url);
+        const newUrl = `${url.protocol}//${url.hostname}${parsed.path}`;
+        
+        item.method = parsed.method;
+        item.url = newUrl;
+        item.headers = parsed.headers;
+        item.body = parsed.body;
+    }
     
     updateInterceptTable();
 }
@@ -707,22 +841,38 @@ function forwardRequest() {
         return;
     }
     
-    const req = interceptQueue[selectedInterceptIndex];
+    const item = interceptQueue[selectedInterceptIndex];
     const raw = document.getElementById('intercept-editor').value;
-    const parsed = parseRawRequest(raw);
-    const url = new URL(req.url);
-    const newUrl = `${url.protocol}//${url.hostname}${parsed.path}`;
     
-    sendMessage({
-        action: 'forward_request',
-        id: req.id,
-        request: {
-            method: parsed.method,
-            url: newUrl,
-            headers: parsed.headers,
-            body: parsed.body
-        }
-    });
+    if (item.itemType === 'response') {
+        // Forward response
+        const parsed = parseRawResponse(raw);
+        sendMessage({
+            action: 'forward_response',
+            id: item.id,
+            response: {
+                status_code: parsed.statusCode,
+                headers: parsed.headers,
+                body: parsed.body
+            }
+        });
+    } else {
+        // Forward request
+        const parsed = parseRawRequest(raw);
+        const url = new URL(item.url);
+        const newUrl = `${url.protocol}//${url.hostname}${parsed.path}`;
+        
+        sendMessage({
+            action: 'forward_request',
+            id: item.id,
+            request: {
+                method: parsed.method,
+                url: newUrl,
+                headers: parsed.headers,
+                body: parsed.body
+            }
+        });
+    }
 }
 
 function dropRequest() {
@@ -731,11 +881,19 @@ function dropRequest() {
         return;
     }
     
-    const req = interceptQueue[selectedInterceptIndex];
-    sendMessage({
-        action: 'drop_request',
-        id: req.id
-    });
+    const item = interceptQueue[selectedInterceptIndex];
+    
+    if (item.itemType === 'response') {
+        sendMessage({
+            action: 'drop_response',
+            id: item.id
+        });
+    } else {
+        sendMessage({
+            action: 'drop_request',
+            id: item.id
+        });
+    }
 }
 
 function forwardAll() {

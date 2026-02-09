@@ -159,9 +159,21 @@ def add_to_intercept_queue(req_id, method, url, host, headers, body, raw_request
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("""
-        INSERT INTO intercept_queue (id, method, url, host, headers, body, raw_request, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+        INSERT INTO intercept_queue (id, method, url, host, headers, body, raw_request, status, item_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 'request')
     """, (req_id, method, url, host, headers, body, raw_request))
+    conn.commit()
+    conn.close()
+
+def add_response_to_queue(resp_id, parent_id, method, url, host, status_code, response_headers, response_body, raw_response):
+    """Add response to intercept queue"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO intercept_queue (id, parent_id, method, url, host, status_code, response_headers, response_body, 
+                                     raw_response, status, item_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'response')
+    """, (resp_id, parent_id, method, url, host, status_code, response_headers, response_body, raw_response))
     conn.commit()
     conn.close()
 
@@ -169,12 +181,21 @@ def get_intercept_status(req_id):
     """Get the status of an intercepted request"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT status, modified_method, modified_url, modified_headers, modified_body FROM intercept_queue WHERE id = ?", (req_id,))
+    c.execute("SELECT status, modified_method, modified_url, modified_headers, modified_body, item_type, modified_response_headers, modified_response_body FROM intercept_queue WHERE id = ?", (req_id,))
     row = c.fetchone()
     conn.close()
     return row
 
-def update_intercept_status(req_id, status, modified=None):
+def get_response_intercept_status(resp_id):
+    """Get the status of an intercepted response"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT status, modified_response_headers, modified_response_body FROM intercept_queue WHERE id = ?", (resp_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def update_intercept_status(req_id, status, modified=None, response_modified=None):
     """Update intercept status (called from WebSocket)"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -184,6 +205,12 @@ def update_intercept_status(req_id, status, modified=None):
             SET status = ?, modified_method = ?, modified_url = ?, modified_headers = ?, modified_body = ?
             WHERE id = ?
         """, (status, modified.get('method'), modified.get('url'), modified.get('headers'), modified.get('body'), req_id))
+    elif response_modified:
+        c.execute("""
+            UPDATE intercept_queue 
+            SET status = ?, modified_response_headers = ?, modified_response_body = ?
+            WHERE id = ?
+        """, (status, response_modified.get('headers'), response_modified.get('body'), req_id))
     else:
         c.execute("UPDATE intercept_queue SET status = ? WHERE id = ?", (status, req_id))
     conn.commit()
@@ -201,7 +228,13 @@ def get_pending_intercepts():
     """Get all pending intercepts that haven't been notified yet"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT id, method, url, host, headers, body, raw_request FROM intercept_queue WHERE status = 'pending' AND notified = 0 ORDER BY created_at")
+    c.execute("""
+        SELECT id, method, url, host, headers, body, raw_request, item_type, status_code, 
+               response_headers, response_body, raw_response, parent_id 
+        FROM intercept_queue 
+        WHERE status = 'pending' AND notified = 0 
+        ORDER BY created_at
+    """)
     rows = c.fetchall()
     conn.close()
     return rows
@@ -454,7 +487,7 @@ async def poll_intercepts():
             
             # Notify all connected clients about new pending intercepts
             for row in pending:
-                req_id, method, url, host, headers, body, raw_request = row
+                req_id, method, url, host, headers, body, raw_request, item_type, status_code, response_headers, response_body, raw_response, parent_id = row
                 
                 # Skip if already notified in this session
                 if req_id in notified_requests:
@@ -467,16 +500,30 @@ async def poll_intercepts():
                 # Notify all connected WebSocket clients
                 for ws in list(active_websockets):
                     try:
-                        await manager.send_personal_message({
-                            'type': 'intercepted_request',
-                            'id': req_id,
-                            'method': method,
-                            'url': url,
-                            'host': host,
-                            'headers': headers,
-                            'body': body,
-                            'raw': raw_request
-                        }, ws)
+                        if item_type == 'response':
+                            await manager.send_personal_message({
+                                'type': 'intercepted_response',
+                                'id': req_id,
+                                'parent_id': parent_id,
+                                'method': method,
+                                'url': url,
+                                'host': host,
+                                'status_code': status_code,
+                                'response_headers': response_headers,
+                                'response_body': response_body,
+                                'raw_response': raw_response
+                            }, ws)
+                        else:
+                            await manager.send_personal_message({
+                                'type': 'intercepted_request',
+                                'id': req_id,
+                                'method': method,
+                                'url': url,
+                                'host': host,
+                                'headers': headers,
+                                'body': body,
+                                'raw': raw_request
+                            }, ws)
                     except:
                         pass
                         
@@ -514,6 +561,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 await manager.send_personal_message({'type': 'intercept_status', 'enabled': intercept_enabled}, websocket)
             
+            elif action == 'toggle_response_intercept':
+                response_enabled = data.get('enabled', False)
+                set_response_intercept_enabled(response_enabled)
+                await manager.send_personal_message({'type': 'response_intercept_status', 'enabled': response_enabled}, websocket)
+            
             elif action == 'forward_request':
                 req_id = data.get('id')
                 modified = data.get('request', {})
@@ -524,6 +576,17 @@ async def websocket_endpoint(websocket: WebSocket):
                 req_id = data.get('id')
                 update_intercept_status(req_id, 'drop')
                 await manager.send_personal_message({'type': 'dropped', 'id': req_id}, websocket)
+            
+            elif action == 'forward_response':
+                resp_id = data.get('id')
+                modified = data.get('response', {})
+                update_intercept_status(resp_id, 'forward', response_modified=modified)
+                await manager.send_personal_message({'type': 'forwarded', 'id': resp_id}, websocket)
+            
+            elif action == 'drop_response':
+                resp_id = data.get('id')
+                update_intercept_status(resp_id, 'drop')
+                await manager.send_personal_message({'type': 'dropped', 'id': resp_id}, websocket)
             
             elif action == 'forward_all':
                 requests_list = data.get('requests', [])
@@ -678,6 +741,7 @@ def dashboard():
 
 # Global storage for intercepted flows
 intercepted_flows = {}
+intercepted_responses = {}
 
 # Mitmproxy Addons
 if MITMPROXY_AVAILABLE:
@@ -689,6 +753,7 @@ if MITMPROXY_AVAILABLE:
             self.excluded_ports = [5050]
             self.excluded_patterns = [r"/ws"]
             self.stop_processing = False
+            self.flow_request_ids = {}  # Map flow to request_id for response interception
             # Start background thread to process intercepted flows
             self.processing_thread = threading.Thread(target=self._process_intercepted_flows, daemon=True)
             self.processing_thread.start()
@@ -710,43 +775,76 @@ if MITMPROXY_AVAILABLE:
                     # Get all pending intercepts from database
                     conn = sqlite3.connect(DB_FILE)
                     c = conn.cursor()
-                    c.execute("SELECT id, status, modified_method, modified_url, modified_headers, modified_body FROM intercept_queue WHERE status != 'pending'")
+                    c.execute("SELECT id, status, modified_method, modified_url, modified_headers, modified_body, modified_response_headers, modified_response_body, item_type FROM intercept_queue WHERE status != 'pending'")
                     rows = c.fetchall()
                     conn.close()
                     
                     for row in rows:
-                        req_id, action, mod_method, mod_url, mod_headers, mod_body = row
+                        item_id, action, mod_method, mod_url, mod_headers, mod_body, mod_resp_headers, mod_resp_body, item_type = row
                         
-                        # Find the corresponding flow
-                        if req_id in intercepted_flows:
-                            flow = intercepted_flows.pop(req_id)
-                            
-                            if action == 'drop':
-                                flow.response = http.Response.make(403, b"Request Dropped by Interceptor")
-                            elif action == 'forward':
-                                # Apply any modifications
-                                if mod_method:
-                                    flow.request.method = mod_method
-                                if mod_url:
-                                    flow.request.url = mod_url
-                                if mod_headers:
-                                    new_headers = {}
-                                    for line in mod_headers.split('\n'):
-                                        if ':' in line:
-                                            k, v = line.split(':', 1)
-                                            new_headers[k.strip()] = v.strip()
-                                    flow.request.headers.clear()
-                                    for k, v in new_headers.items():
-                                        flow.request.headers[k] = v
-                                if mod_body is not None:
-                                    flow.request.text = mod_body
-                            
-                            # Resume the flow
-                            if hasattr(flow, 'resume'):
-                                flow.resume()
-                            
-                            # Remove from database
-                            remove_from_intercept_queue(req_id)
+                        # Handle request interception
+                        if item_type == 'request' or item_type is None:
+                            # Find the corresponding flow
+                            if item_id in intercepted_flows:
+                                flow = intercepted_flows.pop(item_id)
+                                
+                                if action == 'drop':
+                                    flow.response = http.Response.make(403, b"Request Dropped by Interceptor")
+                                elif action == 'forward':
+                                    # Apply any modifications
+                                    if mod_method:
+                                        flow.request.method = mod_method
+                                    if mod_url:
+                                        flow.request.url = mod_url
+                                    if mod_headers:
+                                        new_headers = {}
+                                        for line in mod_headers.split('\n'):
+                                            if ':' in line:
+                                                k, v = line.split(':', 1)
+                                                new_headers[k.strip()] = v.strip()
+                                        flow.request.headers.clear()
+                                        for k, v in new_headers.items():
+                                            flow.request.headers[k] = v
+                                    if mod_body is not None:
+                                        flow.request.text = mod_body
+                                
+                                # Resume the flow
+                                if hasattr(flow, 'resume'):
+                                    flow.resume()
+                                
+                                # Remove from database
+                                remove_from_intercept_queue(item_id)
+                        
+                        # Handle response interception
+                        elif item_type == 'response':
+                            # Find the corresponding flow
+                            if item_id in intercepted_responses:
+                                flow = intercepted_responses.pop(item_id)
+                                
+                                if action == 'drop':
+                                    flow.response = http.Response.make(403, b"Response Dropped by Interceptor")
+                                elif action == 'forward':
+                                    # Apply any response modifications
+                                    if mod_resp_headers or mod_resp_body is not None:
+                                        # Parse modified headers
+                                        if mod_resp_headers:
+                                            new_headers = {}
+                                            for line in mod_resp_headers.split('\n'):
+                                                if ':' in line:
+                                                    k, v = line.split(':', 1)
+                                                    new_headers[k.strip()] = v.strip()
+                                            flow.response.headers.clear()
+                                            for k, v in new_headers.items():
+                                                flow.response.headers[k] = v
+                                        if mod_resp_body is not None:
+                                            flow.response.text = mod_resp_body
+                                
+                                # Resume the flow
+                                if hasattr(flow, 'resume'):
+                                    flow.resume()
+                                
+                                # Remove from database
+                                remove_from_intercept_queue(item_id)
                     
                     time.sleep(0.1)  # Poll every 100ms
                 except Exception as e:
@@ -756,10 +854,15 @@ if MITMPROXY_AVAILABLE:
         def request(self, flow):
             # Check if intercept is enabled via database (IPC)
             if not is_intercept_enabled() or not self.should_intercept(flow):
+                # Still track the flow for potential response interception
+                if is_response_intercept_enabled() and self.should_intercept(flow):
+                    req_id = str(uuid.uuid4())
+                    self.flow_request_ids[flow] = req_id
                 return
             
             # Generate unique ID
             req_id = str(uuid.uuid4())
+            self.flow_request_ids[flow] = req_id
             
             # Build raw request
             raw_request = f"{flow.request.method} {flow.request.path} HTTP/1.1\n"
@@ -788,7 +891,43 @@ if MITMPROXY_AVAILABLE:
             flow.intercept()  # This pauses the flow without blocking mitmproxy
         
         def response(self, flow):
-            # Save to history
+            # First, check if we need to intercept the response
+            if is_response_intercept_enabled() and self.should_intercept(flow):
+                # Get the request ID for this flow (if it was intercepted as a request)
+                req_id = self.flow_request_ids.pop(flow, None)
+                
+                # Generate a unique response ID
+                resp_id = str(uuid.uuid4())
+                
+                # Build raw response
+                raw_response = f"HTTP/1.1 {flow.response.status_code} {flow.response.reason}\n"
+                headers_dict = dict(flow.response.headers)
+                headers_str = ""
+                for k, v in headers_dict.items():
+                    raw_response += f"{k}: {v}\n"
+                    headers_str += f"{k}: {v}\n"
+                body = flow.response.text if flow.response.text else ""
+                if body:
+                    raw_response += f"\n{body}"
+                
+                # Add response to database queue
+                add_response_to_queue(
+                    resp_id,
+                    req_id,  # Parent request ID
+                    flow.request.method,
+                    flow.request.url,
+                    flow.request.host,
+                    flow.response.status_code,
+                    headers_str,
+                    body,
+                    raw_response
+                )
+                
+                # Store flow reference and intercept (NON-BLOCKING)
+                intercepted_responses[resp_id] = flow
+                flow.intercept()  # This pauses the flow without blocking mitmproxy
+            
+            # Save to history (always do this)
             try:
                 save_to_history(
                     flow.request.method,
