@@ -59,7 +59,7 @@ pip install -r requirements.txt
 
 ### 2. Run the Dashboard API
 ```bash
-python gui_api.py
+python backend.py
 # or
 uvicorn gui_api:app --host 0.0.0.0 --port 5050
 ```
@@ -67,6 +67,7 @@ uvicorn gui_api:app --host 0.0.0.0 --port 5050
 ### 3. Run mitmproxy with addons
 ```bash
 mitmdump -s intercept_proxy.py -s proxy_logger.py -s intercept_mode.py -p 8080
+mitmdump -s backend.py -p 8080
 ```
 
 ---

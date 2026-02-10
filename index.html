@@ -4,8 +4,6 @@
 <meta charset="UTF-8">
 <title>RedKit Proxy Dashboard</title>
 <script src="https://cdn.tailwindcss.com"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm/css/xterm.css" />
-<script src="https://cdn.jsdelivr.net/npm/xterm/lib/xterm.js"></script>
 <style>
     body { background-color: #0f0f0f; color: #e5e5e5; font-family: monospace; }
     .table-row:hover { background-color: #222; cursor: pointer; }
@@ -19,137 +17,240 @@
     .tab-btn.active { background-color: #ef4444; color: white; }
     .tab-content { display: none; }
     .tab-content.active { display: block; }
-    textarea { resize: vertical; }
-    .result-row:hover { background-color: #1a1a1a; }
-    .result-row.selected { background-color: #2a2a2a; border-left: 3px solid #ef4444; }
-    #terminal-output { 
-        background: #0d0d0d; 
-        color: #0f0; 
-        padding: 10px; 
-        height: 100%; 
-        overflow-y: auto; 
-        font-family: "Courier New", monospace; 
-        font-size: 14px; 
-        white-space: pre-wrap; 
-        word-break: break-word; 
-        line-height: 1.4; 
+    textarea { resize: vertical; font-family: monospace; }
+    .connection-status {
+        position: fixed;
+        top: 10px;
+        right: 10px;
+        padding: 5px 10px;
+        border-radius: 4px;
+        font-size: 12px;
+        font-weight: bold;
     }
-    .loader {
-        border: 3px solid #333;
-        border-top: 3px solid #ef4444;
+    .connection-status.connected { background-color: #10b981; }
+    .connection-status.disconnected { background-color: #ef4444; }
+    .connection-status.connecting { background-color: #f59e0b; }
+    .intercept-table { width: 100%; border-collapse: collapse; }
+    .intercept-table th { 
+        background: #1a1a1a; 
+        padding: 8px; 
+        text-align: left; 
+        border-bottom: 2px solid #333;
+        position: sticky;
+        top: 0;
+    }
+    .intercept-table td { 
+        padding: 8px; 
+        border-bottom: 1px solid #333;
+    }
+    .intercept-table tr:hover { background: #2a2a2a; }
+    .intercept-table tr.selected { background: #3a3a3a; }
+    .btn-action {
+        padding: 8px 16px;
+        border-radius: 4px;
+        font-weight: bold;
+        cursor: pointer;
+        border: none;
+        margin-right: 8px;
+    }
+    .btn-forward { background-color: #10b981; color: white; }
+    .btn-forward:hover { background-color: #059669; }
+    .btn-drop { background-color: #ef4444; color: white; }
+    .btn-drop:hover { background-color: #dc2626; }
+    .btn-forward-all { background-color: #3b82f6; color: white; }
+    .btn-forward-all:hover { background-color: #2563eb; }
+    .btn-drop-all { background-color: #7c3aed; color: white; }
+    .btn-drop-all:hover { background-color: #6d28d9; }
+    .btn-intercept-toggle { background-color: #f59e0b; color: white; }
+    .btn-intercept-toggle.active { background-color: #10b981; }
+    .intercepting { animation: pulse 2s infinite; }
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
+    }
+    .queue-badge {
+        background: #ef4444;
+        color: white;
         border-radius: 50%;
-        width: 20px;
-        height: 20px;
-        animation: spin 1s linear infinite;
-        display: inline-block;
+        padding: 2px 6px;
+        font-size: 10px;
+        margin-left: 5px;
     }
-    @keyframes spin {
-        0% { transform: rotate(0deg); }
-        100% { transform: rotate(360deg); }
+    .split-pane {
+        display: flex;
+        flex-direction: column;
+        height: calc(100% - 60px);
     }
-    /* Response Tabs */
-    .response-tab-btn.active { background-color: #3b82f6 !important; color: white; }
-    .response-tab-content { display: none; }
-    .response-tab-content.active { display: block; }
-    .response-tab-content:not(.hidden) { display: block; }
-    /* Syntax Highlighting */
-    .json-key { color: #f472b6; }
-    .json-string { color: #a5f3fc; }
-    .json-number { color: #fde047; }
-    .json-boolean { color: #c084fc; }
-    .json-null { color: #94a3b8; }
-    .xml-tag { color: #f472b6; }
-    .xml-attr { color: #a5f3fc; }
-    .xml-value { color: #fde047; }
+    .top-pane {
+        flex: 1;
+        overflow: auto;
+        border-bottom: 2px solid #333;
+    }
+    .bottom-pane {
+        height: 40%;
+        display: flex;
+        flex-direction: column;
+    }
 </style>
 </head>
 <body class="p-6">
 
-<h1 class="text-3xl font-bold mb-4">🔥 RedKit Proxy Dashboard</h1>
+<div id="connection-status" class="connection-status connecting">Connecting...</div>
+
+<h1 class="text-3xl font-bold mb-4">RedKit Proxy Dashboard</h1>
 
 <!-- Navigation Tabs -->
 <div class="flex gap-2 mb-4">
-    <button onclick="showTab('proxy')" class="tab-btn active px-4 py-2 rounded bg-gray-700 hover:bg-gray-600" id="tab-proxy">
-        📡 Proxy
+    <button onclick="showTab('interceptor')" class="tab-btn active px-4 py-2 rounded bg-gray-700 hover:bg-gray-600" id="tab-interceptor">
+        Interceptor <span id="queue-count" class="queue-badge hidden">0</span>
     </button>
-    <button onclick="showTab('repeater')" class="tab-btn px-4 py-2 rounded bg-gray-700 hover:bg-gray-600" id="tab-repeater">
-        🔄 Repeater
-    </button>
-    <button onclick="showTab('intruder')" class="tab-btn px-4 py-2 rounded bg-gray-700 hover:bg-gray-600" id="tab-intruder">
-        💥 Intruder
-    </button>
-    <button onclick="showTab('terminal')" class="tab-btn px-4 py-2 rounded bg-gray-700 hover:bg-gray-600" id="tab-terminal">
-        💻 Terminal
-    </button>
+    <button onclick="showTab('history')" class="tab-btn px-4 py-2 rounded bg-gray-700 hover:bg-gray-600" id="tab-history">HTTP History</button>
+    <button onclick="showTab('repeater')" class="tab-btn px-4 py-2 rounded bg-gray-700 hover:bg-gray-600" id="tab-repeater">Repeater</button>
+    <button onclick="showTab('intruder')" class="tab-btn px-4 py-2 rounded bg-gray-700 hover:bg-gray-600" id="tab-intruder">Intruder</button>
 </div>
 
-<!-- ==================== PROXY TAB ==================== -->
-<div id="content-proxy" class="tab-content active">
-    <div class="flex gap-4">
-        <!-- Sidebar Request List -->
-        <div class="w-1/3 bg-[#141414] rounded-xl p-4 shadow h-[75vh] overflow-auto">
-            <h2 class="text-xl font-semibold mb-4">Requests</h2>
-            <input id="search" placeholder="Search URL..." 
-                   class="w-full mb-3 p-2 rounded bg-[#1f1f1f]" />
-
-            <table class="w-full text-sm">
-                <thead class="text-gray-400 border-b border-gray-700">
-                    <tr>
-                        <th>ID</th>
-                        <th>Method</th>
-                        <th>Status</th>
-                        <th>URL</th>
-                    </tr>
-                </thead>
-                <tbody id="traffic"></tbody>
-            </table>
-
-            <button id="toggle-refresh" class="mt-3 p-2 w-full bg-gray-700 rounded hover:bg-gray-600">
-                Pause Auto-Refresh
-            </button>
-
-            <button id="clearRequestsBtn" class="mt-2 p-2 w-full bg-red-600 rounded hover:bg-red-500 text-white">
-                Clear Requests
-            </button>
+<!-- INTERCEPTOR TAB -->
+<div id="content-interceptor" class="tab-content active">
+    <div class="h-[75vh] flex flex-col">
+        <!-- Intercept Controls -->
+        <div class="bg-[#141414] rounded-xl p-4 mb-4">
+            <div class="flex justify-between items-center">
+                <div class="flex gap-2">
+                    <button onclick="toggleIntercept()" id="intercept-toggle-btn" class="btn-action btn-intercept-toggle">
+                        Intercept is OFF
+                    </button>
+                    <span id="intercept-status" class="text-sm text-gray-400 ml-2"></span>
+                </div>
+                <div class="flex gap-2">
+                    <button onclick="markForResponseIntercept()" id="intercept-response-btn" class="btn-action btn-intercept-toggle" style="background-color: #8b5cf6;" disabled>
+                        Intercept Response
+                    </button>
+                    <button onclick="forwardRequest()" class="btn-action btn-forward">Forward</button>
+                    <button onclick="dropRequest()" class="btn-action btn-drop">Drop</button>
+                    <button onclick="forwardAll()" class="btn-action btn-forward-all">Forward All</button>
+                    <button onclick="dropAll()" class="btn-action btn-drop-all">Drop All</button>
+                </div>
+            </div>
+            <div class="mt-2 text-xs text-gray-500">
+                Queue: <span id="queue-size">0</span> requests waiting
+                <span id="response-intercept-status" class="ml-4 text-purple-400"></span>
+            </div>
         </div>
 
-        <!-- Details Panels -->
-        <div class="w-2/3 flex flex-col gap-4">
-            <!-- Request Details -->
-            <div class="bg-[#141414] rounded-xl p-4 shadow h-1/2 overflow-auto">
-                <div class="flex justify-between items-center mb-2">
-                    <h2 class="text-xl font-semibold">Request Details</h2>
-                    <button onclick="sendToRepeater()" class="px-3 py-1 bg-blue-600 rounded hover:bg-blue-500 text-sm">
-                        Send to Repeater →
-                    </button>
-                </div>
-                <button onclick="copyContent('requestHeaders')" class="mb-2 p-1 bg-gray-600 rounded hover:bg-gray-500">Copy Headers</button>
-                <pre id="requestHeaders" class="mb-2 bg-[#1f1f1f] p-2 rounded max-h-32 overflow-auto"></pre>
-                <button onclick="copyContent('requestBody')" class="mb-2 p-1 bg-gray-600 rounded hover:bg-gray-500">Copy Body</button>
-                <pre id="requestBody" class="bg-[#1f1f1f] p-2 rounded max-h-32 overflow-auto"></pre>
+        <!-- Split Pane: Table (top) and Editor (bottom) -->
+        <div class="split-pane bg-[#141414] rounded-xl">
+            <!-- Top: Intercept Table (most recent at bottom) -->
+            <div class="top-pane p-4">
+                <table class="intercept-table text-sm">
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>Method</th>
+                            <th>Host</th>
+                            <th>URL</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="intercept-table-body">
+                        <tr><td colspan="5" class="text-center text-gray-500 py-8">No intercepted requests</td></tr>
+                    </tbody>
+                </table>
             </div>
 
-            <!-- Response Details -->
-            <div class="bg-[#141414] rounded-xl p-4 shadow h-1/2 overflow-auto">
-                <h2 class="text-xl font-semibold mb-2">Response Details</h2>
-                <button onclick="copyContent('responseHeaders')" class="mb-2 p-1 bg-gray-600 rounded hover:bg-gray-500">Copy Headers</button>
-                <pre id="responseHeaders" class="mb-2 bg-[#1f1f1f] p-2 rounded max-h-32 overflow-auto"></pre>
-                <button onclick="copyContent('responseBody')" class="mb-2 p-1 bg-gray-600 rounded hover:bg-gray-500">Copy Body</button>
-                <pre id="responseBody" class="bg-[#1f1f1f] p-2 rounded max-h-32 overflow-auto"></pre>
+            <!-- Bottom: Request/Response Editor (Split view like Burp) -->
+            <div class="bottom-pane border-t border-gray-700">
+                <!-- Single pane view (for editing request or response only) -->
+                <div id="single-editor-pane" class="p-4 h-full flex flex-col">
+                    <div class="flex justify-between items-center mb-2">
+                        <h3 id="single-editor-title" class="text-sm font-semibold text-gray-400">Request Editor (Raw)</h3>
+                        <button onclick="updateInterceptedRequest()" class="px-3 py-1 bg-blue-600 rounded hover:bg-blue-500 text-xs">Update</button>
+                    </div>
+                    <textarea id="intercept-editor" class="w-full flex-1 p-3 rounded bg-[#1f1f1f] text-sm font-mono"
+                        placeholder="GET /path HTTP/1.1
+Host: example.com
+User-Agent: Mozilla/5.0
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 13
+
+key=value"></textarea>
+                </div>
+
+                <!-- Split pane view (for response interception - request read-only, response editable) -->
+                <div id="split-editor-pane" class="hidden h-full flex">
+                    <!-- Left: Request (Read-only) -->
+                    <div class="w-1/2 p-4 border-r border-gray-700 flex flex-col">
+                        <div class="flex justify-between items-center mb-2">
+                            <h3 class="text-sm font-semibold text-gray-400">Request (Read-Only)</h3>
+                        </div>
+                        <textarea id="intercept-request-view" class="w-full flex-1 p-3 rounded bg-[#1a1a1a] text-sm font-mono text-gray-400" readonly></textarea>
+                    </div>
+                    <!-- Right: Response (Editable) -->
+                    <div class="w-1/2 p-4 flex flex-col">
+                        <div class="flex justify-between items-center mb-2">
+                            <h3 class="text-sm font-semibold text-gray-400">Response (Editable)</h3>
+                            <button onclick="updateInterceptedResponse()" class="px-3 py-1 bg-blue-600 rounded hover:bg-blue-500 text-xs">Update Response</button>
+                        </div>
+                        <textarea id="intercept-response-editor" class="w-full flex-1 p-3 rounded bg-[#1f1f1f] text-sm font-mono"
+                            placeholder="HTTP/1.1 200 OK
+Content-Type: text/html
+
+Response body..."></textarea>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
 </div>
 
-<!-- ==================== REPEATER TAB ==================== -->
+<!-- HTTP HISTORY TAB -->
+<div id="content-history" class="tab-content">
+    <div class="flex gap-4 h-[75vh]">
+        <!-- Left: History List -->
+        <div class="w-2/5 bg-[#141414] rounded-xl p-4 shadow flex flex-col">
+            <div class="flex justify-between items-center mb-3">
+                <h2 class="text-lg font-semibold">HTTP History</h2>
+                <button onclick="clearHistory()" class="px-2 py-1 bg-red-600 rounded hover:bg-red-500 text-xs">Clear</button>
+            </div>
+            <input id="history-search" placeholder="Search URL..." class="w-full mb-3 p-2 rounded bg-[#1f1f1f] text-sm" oninput="filterHistory()" />
+            <div class="flex-1 overflow-auto">
+                <table class="w-full text-sm">
+                    <thead class="text-gray-400 border-b border-gray-700 sticky top-0 bg-[#141414]">
+                        <tr><th class="p-2 text-left">ID</th><th class="p-2 text-left">Method</th><th class="p-2 text-left">Status</th><th class="p-2 text-left">URL</th></tr>
+                    </thead>
+                    <tbody id="history-table"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Right: Request/Response Details -->
+        <div class="w-3/5 flex flex-col gap-4">
+            <!-- Request -->
+            <div class="bg-[#141414] rounded-xl p-4 shadow flex-1 overflow-auto">
+                <div class="flex justify-between items-center mb-2">
+                    <h3 class="text-sm font-semibold text-gray-400">Request</h3>
+                    <button onclick="sendHistoryToRepeater()" class="px-2 py-1 bg-blue-600 rounded hover:bg-blue-500 text-xs">Send to Repeater</button>
+                </div>
+                <pre id="history-request-headers" class="bg-[#1f1f1f] p-2 rounded text-xs mb-2">Select a request...</pre>
+                <pre id="history-request-body" class="bg-[#1f1f1f] p-2 rounded text-xs">No request selected</pre>
+            </div>
+
+            <!-- Response -->
+            <div class="bg-[#141414] rounded-xl p-4 shadow flex-1 overflow-auto">
+                <h3 class="text-sm font-semibold text-gray-400 mb-2">Response</h3>
+                <pre id="history-response-headers" class="bg-[#1f1f1f] p-2 rounded text-xs mb-2">Select a request...</pre>
+                <pre id="history-response-body" class="bg-[#1f1f1f] p-2 rounded text-xs">No response selected</pre>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- REPEATER TAB -->
 <div id="content-repeater" class="tab-content">
     <div class="flex gap-4 h-[75vh]">
-        <!-- Request Editor -->
         <div class="w-1/2 bg-[#141414] rounded-xl p-4 shadow flex flex-col">
             <h2 class="text-xl font-semibold mb-3">Request</h2>
-            
             <div class="flex gap-2 mb-3">
-                <select id="repeater-method" class="p-2 rounded bg-[#1f1f1f] w-24">
+                <select id="repeater-method" class="p-2 rounded bg-[#1f1f1f] w-24 text-sm">
                     <option value="GET">GET</option>
                     <option value="POST">POST</option>
                     <option value="PUT">PUT</option>
@@ -158,138 +259,71 @@
                     <option value="HEAD">HEAD</option>
                     <option value="OPTIONS">OPTIONS</option>
                 </select>
-                <input id="repeater-url" placeholder="https://example.com/api/endpoint" 
-                       class="flex-1 p-2 rounded bg-[#1f1f1f]" />
+                <input id="repeater-url" placeholder="https://example.com/api/endpoint" class="flex-1 p-2 rounded bg-[#1f1f1f] text-sm" />
             </div>
-
             <label class="text-gray-400 text-sm mb-1">Headers (JSON)</label>
             <textarea id="repeater-headers" class="p-2 rounded bg-[#1f1f1f] h-24 mb-3 font-mono text-sm">{
-  "Content-Type": "application/json",
-  "User-Agent": "RedKit/1.0"
+  "Content-Type": "application/json"
 }</textarea>
-
             <label class="text-gray-400 text-sm mb-1">Body</label>
             <textarea id="repeater-body" class="p-2 rounded bg-[#1f1f1f] flex-1 font-mono text-sm" placeholder="Request body..."></textarea>
-
             <div class="flex gap-2 mt-3">
-                <button onclick="sendRepeaterRequest()" class="flex-1 p-2 bg-green-600 rounded hover:bg-green-500 font-bold">
-                    🚀 Send
-                </button>
-                <button onclick="clearRepeater()" class="p-2 bg-gray-600 rounded hover:bg-gray-500">
-                    Clear
-                </button>
+                <button onclick="sendRepeaterRequest()" class="flex-1 p-2 bg-green-600 rounded hover:bg-green-500 font-bold text-sm">Send</button>
+                <button onclick="clearRepeater()" class="p-2 bg-gray-600 rounded hover:bg-gray-500 text-sm">Clear</button>
             </div>
         </div>
 
-        <!-- Response Viewer -->
         <div class="w-1/2 bg-[#141414] rounded-xl p-4 shadow flex flex-col">
             <div class="flex justify-between items-center mb-3">
                 <h2 class="text-xl font-semibold">Response</h2>
                 <div id="repeater-status" class="text-sm"></div>
             </div>
-
             <div id="repeater-info" class="flex gap-4 mb-3 text-sm text-gray-400">
                 <span>Status: <span id="repeater-status-code" class="text-white">-</span></span>
                 <span>Time: <span id="repeater-time" class="text-white">-</span></span>
                 <span>Size: <span id="repeater-size" class="text-white">-</span></span>
             </div>
-
-            <!-- Response Tabs -->
-            <div class="flex gap-1 mb-3">
-                <button onclick="showResponseTab('headers')" class="response-tab-btn active px-3 py-1 rounded text-sm bg-gray-700 hover:bg-gray-600" id="resp-tab-headers">
-                    Headers
-                </button>
-                <button onclick="showResponseTab('raw')" class="response-tab-btn px-3 py-1 rounded text-sm bg-gray-700 hover:bg-gray-600" id="resp-tab-raw">
-                    Raw
-                </button>
-                <button onclick="showResponseTab('pretty')" class="response-tab-btn px-3 py-1 rounded text-sm bg-gray-700 hover:bg-gray-600" id="resp-tab-pretty">
-                    Pretty
-                </button>
-                <button onclick="showResponseTab('render')" class="response-tab-btn px-3 py-1 rounded text-sm bg-gray-700 hover:bg-gray-600" id="resp-tab-render">
-                    Render
-                </button>
-                <button onclick="showResponseTab('hex')" class="response-tab-btn px-3 py-1 rounded text-sm bg-gray-700 hover:bg-gray-600" id="resp-tab-hex">
-                    Hex
-                </button>
-            </div>
-
-            <!-- Headers Tab -->
-            <div id="response-content-headers" class="response-tab-content flex-1 overflow-auto">
-                <pre id="repeater-response-headers" class="p-2 rounded bg-[#1f1f1f] h-full overflow-auto text-sm"></pre>
-            </div>
-
-            <!-- Raw Tab -->
-            <div id="response-content-raw" class="response-tab-content flex-1 overflow-auto hidden">
-                <pre id="repeater-response-body" class="p-2 rounded bg-[#1f1f1f] h-full overflow-auto text-sm font-mono"></pre>
-            </div>
-
-            <!-- Pretty Tab (formatted JSON/XML) -->
-            <div id="response-content-pretty" class="response-tab-content flex-1 overflow-auto hidden">
-                <pre id="repeater-response-pretty" class="p-2 rounded bg-[#1f1f1f] h-full overflow-auto text-sm font-mono"></pre>
-            </div>
-
-            <!-- Render Tab (HTML preview) -->
-            <div id="response-content-render" class="response-tab-content flex-1 overflow-auto hidden">
-                <iframe id="repeater-response-render" class="w-full h-full rounded bg-white" sandbox="allow-same-origin"></iframe>
-            </div>
-
-            <!-- Hex Tab -->
-            <div id="response-content-hex" class="response-tab-content flex-1 overflow-auto hidden">
-                <pre id="repeater-response-hex" class="p-2 rounded bg-[#1f1f1f] h-full overflow-auto text-sm font-mono text-green-400"></pre>
-            </div>
-
-            <div class="flex gap-2 mt-3">
-                <button onclick="copyContent('repeater-response-body')" class="p-2 bg-gray-600 rounded hover:bg-gray-500">
-                    Copy Body
-                </button>
-                <button onclick="sendToIntruder()" class="p-2 bg-purple-600 rounded hover:bg-purple-500">
-                    Send to Intruder →
-                </button>
+            <div class="flex-1 overflow-auto">
+                <pre id="repeater-response" class="bg-[#1f1f1f] p-3 rounded text-xs"></pre>
             </div>
         </div>
     </div>
 </div>
 
-<!-- ==================== INTRUDER TAB ==================== -->
+<!-- INTRUDER TAB -->
 <div id="content-intruder" class="tab-content">
     <div class="flex gap-4 h-[75vh]">
-        <!-- Attack Config -->
         <div class="w-1/3 bg-[#141414] rounded-xl p-4 shadow flex flex-col overflow-auto">
             <h2 class="text-xl font-semibold mb-3">Attack Configuration</h2>
 
             <label class="text-gray-400 text-sm mb-1">Attack Type</label>
-            <select id="intruder-attack-type" class="p-2 rounded bg-[#1f1f1f] mb-3">
+            <select id="intruder-attack-type" class="p-2 rounded bg-[#1f1f1f] mb-3 text-sm">
                 <option value="sniper">Sniper - Single position at a time</option>
                 <option value="battering_ram">Battering Ram - Same payload everywhere</option>
-                <option value="pitchfork">Pitchfork - Parallel payloads</option>
-                <option value="cluster_bomb">Cluster Bomb - All combinations</option>
             </select>
 
             <label class="text-gray-400 text-sm mb-1">Method</label>
-            <select id="intruder-method" class="p-2 rounded bg-[#1f1f1f] mb-3 w-full">
+            <select id="intruder-method" class="p-2 rounded bg-[#1f1f1f] mb-3 w-full text-sm">
                 <option value="GET">GET</option>
                 <option value="POST">POST</option>
                 <option value="PUT">PUT</option>
                 <option value="DELETE">DELETE</option>
             </select>
 
-            <label class="text-gray-400 text-sm mb-1">Target URL (use § for positions)</label>
-            <input id="intruder-url" placeholder="https://target.com/user/§1§" 
-                   class="p-2 rounded bg-[#1f1f1f] mb-3" />
+            <label class="text-gray-400 text-sm mb-1">Target URL (use &sect; for positions)</label>
+            <input id="intruder-url" placeholder="https://target.com/user/&sect;1&sect;" class="p-2 rounded bg-[#1f1f1f] mb-3 text-sm" />
 
             <label class="text-gray-400 text-sm mb-1">Headers (JSON)</label>
             <textarea id="intruder-headers" class="p-2 rounded bg-[#1f1f1f] h-20 mb-3 font-mono text-sm">{}</textarea>
 
-            <label class="text-gray-400 text-sm mb-1">Body (use § for positions)</label>
-            <textarea id="intruder-body" class="p-2 rounded bg-[#1f1f1f] h-20 mb-3 font-mono text-sm" 
-                      placeholder="username=§admin§&password=§pass§"></textarea>
+            <label class="text-gray-400 text-sm mb-1">Body (use &sect; for positions)</label>
+            <textarea id="intruder-body" class="p-2 rounded bg-[#1f1f1f] h-20 mb-3 font-mono text-sm" placeholder="username=&sect;admin&sect;&amp;password=&sect;pass&sect;"></textarea>
 
             <label class="text-gray-400 text-sm mb-1">Payloads (one per line)</label>
-            <textarea id="intruder-payloads" class="p-2 rounded bg-[#1f1f1f] flex-1 font-mono text-sm" 
-                      placeholder="admin&#10;root&#10;user&#10;test"></textarea>
+            <textarea id="intruder-payloads" class="p-2 rounded bg-[#1f1f1f] flex-1 font-mono text-sm" placeholder="admin&#10;root&#10;user&#10;test"></textarea>
 
             <div class="flex gap-2 mt-3">
-                <select id="intruder-preset" class="p-2 rounded bg-[#1f1f1f] flex-1" onchange="loadPayloadPreset()">
+                <select id="intruder-preset" class="p-2 rounded bg-[#1f1f1f] flex-1 text-sm" onchange="loadPayloadPreset()">
                     <option value="">Load Preset...</option>
                     <option value="passwords">Common Passwords</option>
                     <option value="usernames">Common Usernames</option>
@@ -297,29 +331,21 @@
                     <option value="xss">XSS Payloads</option>
                     <option value="path_traversal">Path Traversal</option>
                 </select>
-                <input id="intruder-threads" type="number" value="10" min="1" max="50" 
-                       class="p-2 rounded bg-[#1f1f1f] w-20" title="Threads" />
+                <input id="intruder-threads" type="number" value="10" min="1" max="50" class="p-2 rounded bg-[#1f1f1f] w-20 text-sm" title="Threads" />
             </div>
 
             <div class="flex gap-2 mt-3">
-                <button onclick="startIntruderAttack()" id="intruder-start-btn" 
-                        class="flex-1 p-2 bg-red-600 rounded hover:bg-red-500 font-bold">
-                    🚀 Start Attack
-                </button>
-                <button onclick="stopIntruderAttack()" class="p-2 bg-gray-600 rounded hover:bg-gray-500">
-                    Stop
-                </button>
+                <button onclick="startIntruderAttack()" id="intruder-start-btn" class="flex-1 p-2 bg-red-600 rounded hover:bg-red-500 font-bold text-sm">Start Attack</button>
+                <button onclick="stopIntruderAttack()" class="p-2 bg-gray-600 rounded hover:bg-gray-500 text-sm">Stop</button>
             </div>
         </div>
 
-        <!-- Results -->
         <div class="w-2/3 bg-[#141414] rounded-xl p-4 shadow flex flex-col">
             <div class="flex justify-between items-center mb-3">
                 <h2 class="text-xl font-semibold">Results</h2>
                 <div id="intruder-progress" class="text-sm text-gray-400"></div>
             </div>
 
-            <!-- Results Table -->
             <div class="flex-1 overflow-auto mb-3">
                 <table class="w-full text-sm">
                     <thead class="text-gray-400 border-b border-gray-700 sticky top-0 bg-[#141414]">
@@ -335,16 +361,14 @@
                 </table>
             </div>
 
-            <!-- Result Detail -->
             <div class="bg-[#1f1f1f] rounded p-3">
                 <div class="flex justify-between items-center mb-2">
                     <span class="text-gray-400 text-sm">Response Preview</span>
                     <button onclick="copyContent('intruder-response-preview')" class="text-xs p-1 bg-gray-600 rounded">Copy</button>
                 </div>
-                <pre id="intruder-response-preview" class="text-sm max-h-40 overflow-auto"></pre>
+                <pre id="intruder-response-preview" class="text-xs max-h-40 overflow-auto"></pre>
             </div>
 
-            <!-- Summary -->
             <div id="intruder-summary" class="mt-3 p-3 bg-[#1f1f1f] rounded text-sm hidden">
                 <span class="font-bold">Summary:</span>
                 <span id="intruder-summary-text"></span>
@@ -353,106 +377,983 @@
     </div>
 </div>
 
-<!-- ==================== TERMINAL TAB ==================== -->
-<div id="content-terminal" class="tab-content">
-    <div class="bg-[#141414] rounded-xl p-4 shadow h-[75vh]">
-        <h2 class="text-xl font-semibold mb-3">Web Terminal</h2>
-        <div id="terminal" style="width:100%; height:calc(100% - 40px); background:black; border-radius:8px;"></div>
-    </div>
-</div>
-
 <script>
-// ==================== TAB NAVIGATION ====================
-function showTab(tabName) {
-    // Hide all content
-    document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-    document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+// WebSocket Connection
+let ws = null;
+let reconnectInterval = null;
+let intruderResults = [];
+
+// Interceptor state
+let interceptEnabled = false;
+let responseInterceptEnabled = false;
+let interceptQueue = [];
+let selectedInterceptIndex = -1;
+let markedForResponseIntercept = new Set(); // Track requests marked for response interception
+
+// History state
+let historyData = [];
+let selectedHistoryId = null;
+
+function updateConnectionStatus(status) {
+    const el = document.getElementById('connection-status');
+    el.className = 'connection-status ' + status;
+    if (status === 'connected') el.textContent = 'Connected';
+    else if (status === 'disconnected') el.textContent = 'Disconnected';
+    else if (status === 'connecting') el.textContent = 'Connecting...';
+}
+
+function connectWebSocket() {
+    updateConnectionStatus('connecting');
     
-    // Show selected
-    document.getElementById('content-' + tabName).classList.add('active');
-    document.getElementById('tab-' + tabName).classList.add('active');
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
     
-    // Initialize terminal if needed
-    if (tabName === 'terminal' && !terminalInitialized) {
-        initTerminal();
+    ws.onopen = () => {
+        console.log('WebSocket connected');
+        updateConnectionStatus('connected');
+        if (reconnectInterval) {
+            clearInterval(reconnectInterval);
+            reconnectInterval = null;
+        }
+        // Request initial data
+        sendMessage({action: 'get_history'});
+    };
+    
+    ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        handleWebSocketMessage(msg);
+    };
+    
+    ws.onclose = () => {
+        console.log('WebSocket disconnected');
+        updateConnectionStatus('disconnected');
+        if (!reconnectInterval) {
+            reconnectInterval = setInterval(() => {
+                console.log('Attempting to reconnect...');
+                connectWebSocket();
+            }, 3000);
+        }
+    };
+    
+    ws.onerror = (error) => {
+        console.error('WebSocket error:', error);
+        updateConnectionStatus('disconnected');
+    };
+}
+
+function sendMessage(data) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(data));
+    } else {
+        console.error('WebSocket not connected');
     }
 }
 
-// ==================== PROXY TAB ====================
-let autoRefresh = true;
-const refreshInterval = 2000;
-let intervalId = null;
-let currentRequestId = null;
-let currentRequestData = null;
-
-document.getElementById("toggle-refresh").addEventListener("click", () => {
-    autoRefresh = !autoRefresh;
-    document.getElementById("toggle-refresh").textContent = autoRefresh ? "Pause Auto-Refresh" : "Resume Auto-Refresh";
-    if(autoRefresh) startAutoRefresh(); else stopAutoRefresh();
-});
-
-function startAutoRefresh() {
-    stopAutoRefresh();
-    intervalId = setInterval(loadTraffic, refreshInterval);
-}
-
-function stopAutoRefresh() {
-    if(intervalId) clearInterval(intervalId);
-}
-
-async function loadTraffic() {
-    try {
-        const res = await fetch("/api/traffic");
-        const payload = await res.json();
-        let rows = payload.data;
-
-        const search = document.getElementById("search").value.toLowerCase();
-        if (search.trim() !== "") {
-            rows = rows.filter(r => r[2].toLowerCase().includes(search));
+function handleWebSocketMessage(msg) {
+    const type = msg.type;
+    
+    // INTERCEPTOR
+    if (type === 'intercepted_request') {
+        // Check if this request is already in the queue (avoid duplicates)
+        const existingIndex = interceptQueue.findIndex(r => r.id === msg.id);
+        if (existingIndex >= 0) {
+            return; // Already exists, ignore
+        }
+        
+        // Add new request to the END of queue (newest at bottom)
+        interceptQueue.push({
+            id: msg.id,
+            method: msg.method,
+            url: msg.url,
+            host: msg.host,
+            headers: msg.headers,
+            body: msg.body,
+            raw: msg.raw,
+            itemType: 'request'
+        });
+        updateInterceptTable();
+        
+        // Auto-select the newest request if nothing is selected
+        if (selectedInterceptIndex === -1) {
+            selectedInterceptIndex = interceptQueue.length - 1;
+            selectInterceptRequest(selectedInterceptIndex);
+            
+            // Auto-scroll to show the selected request
+            setTimeout(() => {
+                const tableContainer = document.querySelector('.top-pane');
+                if (tableContainer) {
+                    tableContainer.scrollTop = tableContainer.scrollHeight;
+                }
+            }, 100);
+        }
+    }
+    else if (type === 'intercepted_response') {
+        // Check if this response is already in the queue (avoid duplicates)
+        const existingIndex = interceptQueue.findIndex(r => r.id === msg.id);
+        if (existingIndex >= 0) {
+            return; // Already exists, ignore
+        }
+        
+        // Add new response to the END of queue (newest at bottom)
+        interceptQueue.push({
+            id: msg.id,
+            method: msg.method,
+            url: msg.url,
+            host: msg.host,
+            statusCode: msg.status_code,
+            headers: msg.response_headers,
+            body: msg.response_body,
+            raw: msg.raw_response,
+            itemType: 'response',
+            parentId: msg.parent_id,
+            parentRequest: msg.parent_request
+        });
+        updateInterceptTable();
+        
+        // Auto-select the newest response if nothing is selected
+        if (selectedInterceptIndex === -1) {
+            selectedInterceptIndex = interceptQueue.length - 1;
+            selectInterceptRequest(selectedInterceptIndex);
+            
+            // Auto-scroll to show the selected response
+            setTimeout(() => {
+                const tableContainer = document.querySelector('.top-pane');
+                if (tableContainer) {
+                    tableContainer.scrollTop = tableContainer.scrollHeight;
+                }
+            }, 100);
+        }
+    }
+    else if (type === 'forwarded' || type === 'dropped') {
+        // Remove from queue
+        const removedIndex = interceptQueue.findIndex(r => r.id === msg.id);
+        if (removedIndex === -1) {
+            // Check if it's a parent_id (response being forwarded)
+            const parentIndex = interceptQueue.findIndex(r => r.parentId === msg.id);
+            if (parentIndex >= 0) {
+                interceptQueue = interceptQueue.filter(r => r.parentId !== msg.id);
+                markedForResponseIntercept.delete(msg.id);
+                updateInterceptTable();
+                updateInterceptResponseButton();
+            }
+            return;
         }
 
-        const table = document.getElementById("traffic");
-        table.innerHTML = "";
+        const removedItem = interceptQueue[removedIndex];
+        interceptQueue = interceptQueue.filter(r => r.id !== msg.id);
 
-        rows.forEach(row => {
-            const tr = document.createElement("tr");
-            tr.className = "table-row border-b border-gray-800";
+        // Remove from marked set if it was marked
+        markedForResponseIntercept.delete(msg.id);
 
-            let statusClass = "";
-            if(row[3] >= 200 && row[3] < 300) statusClass = "status-2xx";
-            else if(row[3] >= 300 && row[3] < 400) statusClass = "status-3xx";
-            else if(row[3] >= 400 && row[3] < 500) statusClass = "status-4xx";
-            else if(row[3] >= 500) statusClass = "status-5xx";
-
-            tr.innerHTML = `
-                <td class="p-2">${row[0]}</td>
-                <td class="p-2">${row[1]}</td>
-                <td class="p-2"><span class="badge ${statusClass}">${row[3]}</span></td>
-                <td class="p-2 truncate max-w-xs">${row[2]}</td>
-            `;
-
-            tr.onclick = () => showDetails(row[0]);
-            table.appendChild(tr);
-        });
-    } catch (e) {
-        console.error("Failed to load traffic:", e);
+        // Adjust selected index if needed
+        if (removedIndex === selectedInterceptIndex) {
+            // The selected item was removed
+            if (interceptQueue.length > 0) {
+                // Select the next item, or the last one if we removed the last
+                selectedInterceptIndex = Math.min(removedIndex, interceptQueue.length - 1);
+                selectInterceptRequest(selectedInterceptIndex);
+            } else {
+                selectedInterceptIndex = -1;
+                clearInterceptEditor();
+                updateInterceptTable();
+            }
+        } else if (removedIndex < selectedInterceptIndex) {
+            // An item before the selected one was removed, adjust index
+            selectedInterceptIndex--;
+            updateInterceptTable();
+        } else {
+            // An item after the selected one was removed, just update table
+            updateInterceptTable();
+        }
+        updateInterceptResponseButton();
+    }
+    else if (type === 'queue_cleared') {
+        interceptQueue = [];
+        selectedInterceptIndex = -1;
+        markedForResponseIntercept.clear();
+        updateInterceptTable();
+        clearInterceptEditor();
+        updateInterceptResponseButton();
+    }
+    else if (type === 'marked_for_response_intercept') {
+        markedForResponseIntercept.add(msg.id);
+        updateInterceptResponseButton();
+    }
+    else if (type === 'unmarked_for_response_intercept') {
+        markedForResponseIntercept.delete(msg.id);
+        updateInterceptResponseButton();
+    }
+    
+    // HISTORY
+    else if (type === 'history') {
+        historyData = msg.data;
+        renderHistory();
+    }
+    else if (type === 'history_detail') {
+        document.getElementById('history-request-headers').innerText = msg.request_headers || 'No headers';
+        document.getElementById('history-request-body').innerText = msg.request_body || 'No body';
+        document.getElementById('history-response-headers').innerText = msg.response_headers || 'No headers';
+        document.getElementById('history-response-body').innerText = msg.response_body || 'No body';
+    }
+    else if (type === 'history_cleared') {
+        historyData = [];
+        renderHistory();
+        document.getElementById('history-request-headers').innerText = 'Select a request...';
+        document.getElementById('history-request-body').innerText = 'No request selected';
+        document.getElementById('history-response-headers').innerText = 'Select a request...';
+        document.getElementById('history-response-body').innerText = 'No response selected';
+    }
+    
+    // REPEATER
+    else if (type === 'repeater_response') {
+        if (msg.success) {
+            document.getElementById("repeater-status").innerHTML = '<span class="text-green-500">Success</span>';
+            document.getElementById("repeater-status-code").innerText = msg.data.status_code;
+            document.getElementById("repeater-time").innerText = msg.data.elapsed_time + "s";
+            document.getElementById("repeater-size").innerText = msg.data.size + " bytes";
+            document.getElementById("repeater-response").innerText = msg.data.body;
+        } else {
+            document.getElementById("repeater-status").innerHTML = '<span class="text-red-500">Error: ' + msg.error + '</span>';
+        }
+    }
+    
+    // INTRUDER
+    else if (type === 'intruder_results') {
+        intruderResults = msg.results;
+        renderIntruderResults(msg.results, msg.total);
+    }
+    else if (type === 'intruder_stopped') {
+        document.getElementById("intruder-progress").innerText = "Attack stopped";
+    }
+    else if (type === 'payloads') {
+        document.getElementById("intruder-payloads").value = msg.payloads.join("\n");
+        document.getElementById("intruder-preset").value = "";
+    }
+    else if (type === 'error') {
+        console.error('Server error:', msg.message);
     }
 }
 
-async function showDetails(id) {
-    currentRequestId = id;
+// ==================== INTERCEPTOR ====================
+function toggleIntercept() {
+    interceptEnabled = !interceptEnabled;
+    const btn = document.getElementById('intercept-toggle-btn');
+    const indicator = document.getElementById('intercept-status');
     
-    const reqRes = await fetch("/api/request/" + id);
-    const reqData = await reqRes.json();
-    currentRequestData = reqData.data;
+    if (interceptEnabled) {
+        btn.innerHTML = 'Intercept is ON';
+        btn.classList.add('active');
+        indicator.innerHTML = '<span class="intercepting text-green-500">Intercepting Requests...</span>';
+    } else {
+        btn.innerHTML = 'Intercept is OFF';
+        btn.classList.remove('active');
+        if (!responseInterceptEnabled) {
+            indicator.innerHTML = '';
+        }
+    }
     
-    document.getElementById("requestHeaders").innerText = reqData.data[2] || "{}";
-    document.getElementById("requestBody").innerText = reqData.data[3] || "";
+    sendMessage({action: 'toggle_intercept', enabled: interceptEnabled});
+}
 
-    const resRes = await fetch("/api/response/" + id);
-    const resData = await resRes.json();
-    document.getElementById("responseHeaders").innerText = resData.data[1] || "{}";
-    document.getElementById("responseBody").innerText = resData.data[2] || "";
+function toggleResponseIntercept() {
+    responseInterceptEnabled = !responseInterceptEnabled;
+    const btn = document.getElementById('response-intercept-toggle-btn');
+    const indicator = document.getElementById('intercept-status');
+    
+    if (responseInterceptEnabled) {
+        btn.innerHTML = 'Response Intercept is ON';
+        btn.classList.add('active');
+        indicator.innerHTML = '<span class="intercepting text-blue-500">Intercepting Responses...</span>';
+    } else {
+        btn.innerHTML = 'Response Intercept is OFF';
+        btn.classList.remove('active');
+        if (!interceptEnabled) {
+            indicator.innerHTML = '';
+        }
+    }
+    
+    sendMessage({action: 'toggle_response_intercept', enabled: responseInterceptEnabled});
+}
+
+function updateInterceptTable() {
+    const tbody = document.getElementById('intercept-table-body');
+    const countEl = document.getElementById('queue-count');
+    const sizeEl = document.getElementById('queue-size');
+    
+    sizeEl.textContent = interceptQueue.length;
+    
+    if (interceptQueue.length > 0) {
+        countEl.textContent = interceptQueue.length;
+        countEl.classList.remove('hidden');
+    } else {
+        countEl.classList.add('hidden');
+    }
+    
+    if (interceptQueue.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" class="text-center text-gray-500 py-8">No intercepted requests</td></tr>';
+        return;
+    }
+    
+    // Display requests: Oldest at top (index 0), newest at bottom
+    // The interceptQueue array maintains order - oldest are at the beginning
+    tbody.innerHTML = interceptQueue.map((req, index) => {
+        let url;
+        try {
+            url = new URL(req.url);
+        } catch (e) {
+            url = { hostname: 'unknown', pathname: req.url, search: '' };
+        }
+        const displayUrl = url.pathname + url.search;
+        const truncatedUrl = displayUrl.length > 50 ? displayUrl.substring(0, 50) + '...' : displayUrl;
+        
+        // Check if it's a response
+        const isResponse = req.itemType === 'response';
+        const isMarkedForResponse = markedForResponseIntercept.has(req.id);
+        const rowClass = isResponse ? 'bg-blue-900/30' : (isMarkedForResponse ? 'bg-purple-900/30' : '');
+        const typeLabel = isResponse ? 'RESPONSE' : (isMarkedForResponse ? 'REQUEST →' : 'REQUEST');
+        const statusDisplay = isResponse ? `<span class="badge ${getStatusColor(req.statusCode)}">${req.statusCode || '-'}</span>` : (isMarkedForResponse ? '<span class="text-purple-400">Intercepting</span>' : 'Waiting');
+        
+        return `
+        <tr class="${index === selectedInterceptIndex ? 'selected' : ''} ${rowClass}" onclick="selectInterceptRequest(${index})">
+            <td>${index + 1}</td>
+            <td><span class="badge ${getMethodColor(req.method)}">${req.method}</span></td>
+            <td>${url.hostname}</td>
+            <td class="truncate max-w-xs" title="${displayUrl}">${truncatedUrl}</td>
+            <td>${typeLabel} ${statusDisplay}</td>
+        </tr>
+    `}).join('');
+}
+
+function getStatusColor(statusCode) {
+    if (!statusCode) return '';
+    if (statusCode >= 200 && statusCode < 300) return 'status-2xx';
+    if (statusCode >= 300 && statusCode < 400) return 'status-3xx';
+    if (statusCode >= 400 && statusCode < 500) return 'status-4xx';
+    if (statusCode >= 500) return 'status-5xx';
+    return '';
+}
+
+function getMethodColor(method) {
+    if (method === 'GET') return 'status-2xx';
+    if (method === 'POST') return 'status-3xx';
+    if (method === 'PUT') return 'status-4xx';
+    if (method === 'DELETE') return 'status-5xx';
+    return '';
+}
+
+function selectInterceptRequest(index) {
+    if (index < 0 || index >= interceptQueue.length) {
+        clearInterceptEditor();
+        updateInterceptResponseButton();
+        return;
+    }
+
+    selectedInterceptIndex = index;
+    const req = interceptQueue[index];
+    if (!req) {
+        clearInterceptEditor();
+        updateInterceptResponseButton();
+        return;
+    }
+
+    // Check if this request is marked for response interception
+    const isMarkedForResponse = markedForResponseIntercept.has(req.id);
+
+    if (req.itemType === 'response') {
+        // It's a response - show split view with request and response
+        showSplitPane(req);
+    } else {
+        // It's a request - show single editor
+        showSinglePane(req);
+    }
+
+    updateInterceptResponseButton();
+    updateInterceptTable();
+}
+
+function showSinglePane(req) {
+    document.getElementById('single-editor-pane').classList.remove('hidden');
+    document.getElementById('split-editor-pane').classList.add('hidden');
+
+    const editorTitle = document.getElementById('single-editor-title');
+    editorTitle.textContent = 'Request Editor (Raw)';
+
+    let raw = req.raw || buildRawRequest(req);
+    document.getElementById('intercept-editor').value = raw;
+}
+
+function showSplitPane(resp) {
+    // Hide single pane, show split pane
+    document.getElementById('single-editor-pane').classList.add('hidden');
+    document.getElementById('split-editor-pane').classList.remove('hidden');
+
+    // Use parent request data from response (sent by backend)
+    const parentReq = resp.parentRequest;
+
+    // Show request (read-only)
+    if (parentReq) {
+        const requestRaw = parentReq.raw || buildRawRequest(parentReq);
+        document.getElementById('intercept-request-view').value = requestRaw;
+    } else {
+        document.getElementById('intercept-request-view').value = 'Request not available';
+    }
+
+    // Show response (editable)
+    let responseRaw = resp.raw || buildRawResponse(resp);
+    document.getElementById('intercept-response-editor').value = responseRaw;
+}
+
+function updateInterceptResponseButton() {
+    const btn = document.getElementById('intercept-response-btn');
+
+    if (selectedInterceptIndex < 0 || selectedInterceptIndex >= interceptQueue.length) {
+        btn.disabled = true;
+        btn.textContent = 'Intercept Response';
+        btn.style.backgroundColor = '#6b7280';
+        return;
+    }
+
+    const req = interceptQueue[selectedInterceptIndex];
+
+    // Only enable for requests (not responses)
+    if (req.itemType === 'response') {
+        btn.disabled = true;
+        btn.textContent = 'Intercept Response';
+        btn.style.backgroundColor = '#6b7280';
+        return;
+    }
+
+    btn.disabled = false;
+    const isMarked = markedForResponseIntercept.has(req.id);
+
+    if (isMarked) {
+        btn.textContent = 'Cancel Response Intercept';
+        btn.style.backgroundColor = '#ef4444';
+        document.getElementById('response-intercept-status').textContent = 'Response will be intercepted';
+    } else {
+        btn.textContent = 'Intercept Response';
+        btn.style.backgroundColor = '#8b5cf6';
+        document.getElementById('response-intercept-status').textContent = '';
+    }
+}
+
+function markForResponseIntercept() {
+    if (selectedInterceptIndex < 0 || selectedInterceptIndex >= interceptQueue.length) return;
+
+    const req = interceptQueue[selectedInterceptIndex];
+    if (req.itemType === 'response') return;
+
+    const isMarked = markedForResponseIntercept.has(req.id);
+
+    if (isMarked) {
+        // Unmark
+        markedForResponseIntercept.delete(req.id);
+        sendMessage({
+            action: 'unmark_for_response_intercept',
+            id: req.id
+        });
+    } else {
+        // Mark
+        markedForResponseIntercept.add(req.id);
+        sendMessage({
+            action: 'mark_for_response_intercept',
+            id: req.id
+        });
+    }
+
+    updateInterceptResponseButton();
+}
+
+function clearInterceptEditor() {
+    const editor = document.getElementById('intercept-editor');
+    if (editor) {
+        editor.value = '';
+    }
+    const editorTitle = document.getElementById('single-editor-title');
+    if (editorTitle) editorTitle.textContent = 'Request Editor (Raw)';
+
+    // Also clear split pane
+    document.getElementById('intercept-request-view').value = '';
+    document.getElementById('intercept-response-editor').value = '';
+
+    // Reset to single pane view
+    document.getElementById('single-editor-pane').classList.remove('hidden');
+    document.getElementById('split-editor-pane').classList.add('hidden');
+}
+
+function buildRawRequest(req) {
+    const url = new URL(req.url);
+    let raw = `${req.method} ${url.pathname}${url.search} HTTP/1.1\n`;
+    raw += `Host: ${url.hostname}\n`;
+    raw += req.headers;
+    if (req.body) {
+        raw += `\n\n${req.body}`;
+    }
+    return raw;
+}
+
+function buildRawResponse(resp) {
+    let raw = `HTTP/1.1 ${resp.statusCode || 200} OK\n`;
+    raw += resp.headers || '';
+    if (resp.body) {
+        raw += `\n\n${resp.body}`;
+    }
+    return raw;
+}
+
+function parseRawRequest(raw) {
+    const lines = raw.split('\n');
+    const firstLine = lines[0].trim();
+    const parts = firstLine.split(' ');
+    const method = parts[0];
+    const path = parts[1] || '/';
+    
+    // Find where body starts
+    let bodyStart = -1;
+    let headers = [];
+    for (let i = 1; i < lines.length; i++) {
+        if (lines[i].trim() === '') {
+            bodyStart = i + 1;
+            break;
+        }
+        headers.push(lines[i]);
+    }
+    
+    const body = bodyStart > 0 ? lines.slice(bodyStart).join('\n') : '';
+    
+    return {
+        method: method,
+        path: path,
+        headers: headers.join('\n'),
+        body: body
+    };
+}
+
+function parseRawResponse(raw) {
+    const lines = raw.split('\n');
+    const firstLine = lines[0].trim();
+    // Parse status line: HTTP/1.1 200 OK
+    const statusMatch = firstLine.match(/HTTP\/\d\.\d\s+(\d+)\s+(.*)/);
+    const statusCode = statusMatch ? parseInt(statusMatch[1]) : 200;
+    
+    // Find where body starts
+    let bodyStart = -1;
+    let headers = [];
+    for (let i = 1; i < lines.length; i++) {
+        if (lines[i].trim() === '') {
+            bodyStart = i + 1;
+            break;
+        }
+        headers.push(lines[i]);
+    }
+    
+    const body = bodyStart > 0 ? lines.slice(bodyStart).join('\n') : '';
+    
+    return {
+        statusCode: statusCode,
+        headers: headers.join('\n'),
+        body: body
+    };
+}
+
+function updateInterceptedRequest() {
+    if (selectedInterceptIndex < 0 || selectedInterceptIndex >= interceptQueue.length) {
+        alert('No request selected');
+        return;
+    }
+    
+    const item = interceptQueue[selectedInterceptIndex];
+    const raw = document.getElementById('intercept-editor').value;
+    
+    if (item.itemType === 'response') {
+        // Update response
+        const parsed = parseRawResponse(raw);
+        item.statusCode = parsed.statusCode;
+        item.headers = parsed.headers;
+        item.body = parsed.body;
+    } else {
+        // Update request
+        const parsed = parseRawRequest(raw);
+        const url = new URL(item.url);
+        const newUrl = `${url.protocol}//${url.hostname}${parsed.path}`;
+        
+        item.method = parsed.method;
+        item.url = newUrl;
+        item.headers = parsed.headers;
+        item.body = parsed.body;
+    }
+    
+    updateInterceptTable();
+}
+
+function forwardRequest() {
+    if (selectedInterceptIndex < 0 || selectedInterceptIndex >= interceptQueue.length) {
+        alert('No request selected');
+        return;
+    }
+
+    const item = interceptQueue[selectedInterceptIndex];
+
+    // Check if we're in split pane mode (response interception)
+    const isSplitPane = !document.getElementById('split-editor-pane').classList.contains('hidden');
+
+    if (isSplitPane && item.itemType === 'response') {
+        // Forward response from split pane
+        const responseRaw = document.getElementById('intercept-response-editor').value;
+        const parsed = parseRawResponse(responseRaw);
+        sendMessage({
+            action: 'forward_response',
+            id: item.id,
+            response: {
+                status_code: parsed.statusCode,
+                headers: parsed.headers,
+                body: parsed.body
+            }
+        });
+    } else if (item.itemType === 'response') {
+        // Forward response from single pane (fallback)
+        const raw = document.getElementById('intercept-editor').value;
+        const parsed = parseRawResponse(raw);
+        sendMessage({
+            action: 'forward_response',
+            id: item.id,
+            response: {
+                status_code: parsed.statusCode,
+                headers: parsed.headers,
+                body: parsed.body
+            }
+        });
+    } else {
+        // Forward request
+        const raw = document.getElementById('intercept-editor').value;
+        const parsed = parseRawRequest(raw);
+        const url = new URL(item.url);
+        const newUrl = `${url.protocol}//${url.hostname}${parsed.path}`;
+
+        sendMessage({
+            action: 'forward_request',
+            id: item.id,
+            request: {
+                method: parsed.method,
+                url: newUrl,
+                headers: parsed.headers,
+                body: parsed.body
+            }
+        });
+    }
+}
+
+function updateInterceptedResponse() {
+    if (selectedInterceptIndex < 0 || selectedInterceptIndex >= interceptQueue.length) {
+        alert('No response selected');
+        return;
+    }
+
+    const item = interceptQueue[selectedInterceptIndex];
+    if (item.itemType !== 'response') {
+        alert('No response selected');
+        return;
+    }
+
+    const responseRaw = document.getElementById('intercept-response-editor').value;
+    const parsed = parseRawResponse(responseRaw);
+
+    item.statusCode = parsed.statusCode;
+    item.headers = parsed.headers;
+    item.body = parsed.body;
+
+    updateInterceptTable();
+}
+
+function dropRequest() {
+    if (selectedInterceptIndex < 0 || selectedInterceptIndex >= interceptQueue.length) {
+        alert('No request selected');
+        return;
+    }
+    
+    const item = interceptQueue[selectedInterceptIndex];
+    
+    if (item.itemType === 'response') {
+        sendMessage({
+            action: 'drop_response',
+            id: item.id
+        });
+    } else {
+        sendMessage({
+            action: 'drop_request',
+            id: item.id
+        });
+    }
+}
+
+function forwardAll() {
+    if (interceptQueue.length === 0) return;
+    
+    // Store the requests to forward
+    const requestsToForward = interceptQueue.map(r => ({
+        id: r.id,
+        method: r.method,
+        url: r.url,
+        headers: r.headers,
+        body: r.body
+    }));
+    
+    // Immediately clear the local queue to prevent UI inconsistencies
+    interceptQueue = [];
+    selectedInterceptIndex = -1;
+    clearInterceptEditor();
+    updateInterceptTable();
+    
+    sendMessage({
+        action: 'forward_all',
+        requests: requestsToForward
+    });
+}
+
+function dropAll() {
+    if (interceptQueue.length === 0) return;
+    
+    if (!confirm(`Drop all ${interceptQueue.length} intercepted requests?`)) return;
+    
+    // Store IDs before clearing
+    const idsToDrop = interceptQueue.map(r => r.id);
+    
+    // Immediately clear the local queue to prevent UI inconsistencies
+    interceptQueue = [];
+    selectedInterceptIndex = -1;
+    clearInterceptEditor();
+    updateInterceptTable();
+    
+    sendMessage({
+        action: 'drop_all',
+        ids: idsToDrop
+    });
+}
+
+// ==================== HISTORY ====================
+function renderHistory() {
+    const search = document.getElementById('history-search').value.toLowerCase();
+    let rows = historyData;
+    
+    if (search.trim() !== '') {
+        rows = rows.filter(r => r[2].toLowerCase().includes(search));
+    }
+    
+    const tbody = document.getElementById('history-table');
+    tbody.innerHTML = '';
+    
+    rows.forEach(row => {
+        const tr = document.createElement('tr');
+        tr.className = 'table-row border-b border-gray-800 cursor-pointer';
+        
+        let statusClass = '';
+        if(row[3] >= 200 && row[3] < 300) statusClass = 'status-2xx';
+        else if(row[3] >= 300 && row[3] < 400) statusClass = 'status-3xx';
+        else if(row[3] >= 400 && row[3] < 500) statusClass = 'status-4xx';
+        else if(row[3] >= 500) statusClass = 'status-5xx';
+        
+        tr.innerHTML = `
+            <td class="p-2">${row[0]}</td>
+            <td class="p-2">${row[1]}</td>
+            <td class="p-2"><span class="badge ${statusClass}">${row[3]}</span></td>
+            <td class="p-2 truncate max-w-xs">${row[2]}</td>
+        `;
+        
+        tr.onclick = () => selectHistoryItem(row[0]);
+        tbody.appendChild(tr);
+    });
+}
+
+function filterHistory() {
+    renderHistory();
+}
+
+function selectHistoryItem(id) {
+    selectedHistoryId = id;
+    sendMessage({action: 'get_history_detail', id: id});
+}
+
+function clearHistory() {
+    if (!confirm('Clear all history?')) return;
+    sendMessage({action: 'clear_history'});
+}
+
+function sendHistoryToRepeater() {
+    if (!selectedHistoryId) {
+        alert('Select a request first');
+        return;
+    }
+    // TODO: Implement sending to repeater
+    alert('Feature coming soon');
+}
+
+// ==================== REPEATER ====================
+function sendRepeaterRequest() {
+    const method = document.getElementById('repeater-method').value;
+    const url = document.getElementById('repeater-url').value;
+    let headers = {};
+    
+    try {
+        headers = JSON.parse(document.getElementById('repeater-headers').value);
+    } catch (e) {
+        alert('Invalid headers JSON!');
+        return;
+    }
+    
+    const body = document.getElementById('repeater-body').value;
+    
+    document.getElementById('repeater-status').innerHTML = '<span class="loader"></span> Sending...';
+    
+    sendMessage({
+        action: 'repeater_send',
+        request: {
+            method: method,
+            url: url,
+            headers: headers,
+            body: body,
+            timeout: 30,
+            follow_redirects: true
+        }
+    });
+}
+
+function clearRepeater() {
+    document.getElementById('repeater-url').value = '';
+    document.getElementById('repeater-headers').value = '{\n  "Content-Type": "application/json"\n}';
+    document.getElementById('repeater-body').value = '';
+    document.getElementById('repeater-response').innerText = '';
+    document.getElementById('repeater-status-code').innerText = '-';
+    document.getElementById('repeater-time').innerText = '-';
+    document.getElementById('repeater-size').innerText = '-';
+}
+
+function sendToIntruder() {
+    showTab('intruder');
+    document.getElementById('intruder-method').value = document.getElementById('repeater-method').value;
+    document.getElementById('intruder-url').value = document.getElementById('repeater-url').value;
+    document.getElementById('intruder-headers').value = document.getElementById('repeater-headers').value;
+    document.getElementById('intruder-body').value = document.getElementById('repeater-body').value;
+}
+
+// ==================== INTRUDER ====================
+function loadPayloadPreset() {
+    const preset = document.getElementById('intruder-preset').value;
+    if (!preset) return;
+    
+    sendMessage({
+        action: 'get_payloads',
+        payload_type: preset,
+        start: 0,
+        end: 100,
+        step: 1
+    });
+}
+
+function startIntruderAttack() {
+    const attackType = document.getElementById('intruder-attack-type').value;
+    const method = document.getElementById('intruder-method').value;
+    const url = document.getElementById('intruder-url').value;
+    const body = document.getElementById('intruder-body').value;
+    const threads = parseInt(document.getElementById('intruder-threads').value) || 10;
+    
+    let headers = {};
+    try {
+        headers = JSON.parse(document.getElementById('intruder-headers').value);
+    } catch (e) {
+        alert('Invalid headers JSON!');
+        return;
+    }
+    
+    const payloadsText = document.getElementById('intruder-payloads').value;
+    const payloads = payloadsText.split('\n').filter(p => p.trim());
+    
+    if (payloads.length === 0) {
+        alert('Please enter payloads!');
+        return;
+    }
+    
+    document.getElementById('intruder-results').innerHTML = '';
+    document.getElementById('intruder-response-preview').innerText = '';
+    document.getElementById('intruder-summary').classList.add('hidden');
+    intruderResults = [];
+    
+    document.getElementById('intruder-start-btn').disabled = true;
+    document.getElementById('intruder-start-btn').innerText = 'Running...';
+    document.getElementById('intruder-progress').innerText = 'Starting attack...';
+    
+    sendMessage({
+        action: 'intruder_attack',
+        method: method,
+        url: url,
+        headers: headers,
+        body: body,
+        attack_type: attackType,
+        payloads: payloads,
+        threads: threads,
+        timeout: 30
+    });
+}
+
+function renderIntruderResults(results, total) {
+    const tbody = document.getElementById('intruder-results');
+    tbody.innerHTML = '';
+    
+    results.forEach((r, i) => {
+        const tr = document.createElement('tr');
+        tr.className = 'result-row border-b border-gray-800 cursor-pointer';
+        
+        let statusClass = '';
+        if(r.status_code >= 200 && r.status_code < 300) statusClass = 'status-2xx';
+        else if(r.status_code >= 300 && r.status_code < 400) statusClass = 'status-3xx';
+        else if(r.status_code >= 400 && r.status_code < 500) statusClass = 'status-4xx';
+        else if(r.status_code >= 500) statusClass = 'status-5xx';
+        
+        tr.innerHTML = `
+            <td class="p-2">${i + 1}</td>
+            <td class="p-2 truncate max-w-xs">${r.payload}</td>
+            <td class="p-2"><span class="badge ${statusClass}">${r.status_code || 'ERR'}</span></td>
+            <td class="p-2">${r.length}</td>
+            <td class="p-2">${r.time}s</td>
+        `;
+        
+        tr.onclick = () => showIntruderResult(i, tr);
+        tbody.appendChild(tr);
+    });
+    
+    document.getElementById('intruder-progress').innerText = `Completed: ${total} requests`;
+    document.getElementById('intruder-summary').classList.remove('hidden');
+    
+    const errors = results.filter(r => r.error).length;
+    const avgLength = results.length > 0 ? Math.round(results.reduce((a, r) => a + r.length, 0) / results.length) : 0;
+    const avgTime = results.length > 0 ? (results.reduce((a, r) => a + r.time, 0) / results.length).toFixed(3) : 0;
+    
+    document.getElementById('intruder-summary-text').innerText = 
+        `Total: ${total} | Errors: ${errors} | Avg Length: ${avgLength} bytes | Avg Time: ${avgTime}s`;
+    
+    document.getElementById('intruder-start-btn').disabled = false;
+    document.getElementById('intruder-start-btn').innerText = 'Start Attack';
+}
+
+function showIntruderResult(index, row) {
+    document.querySelectorAll('.result-row').forEach(r => r.classList.remove('selected'));
+    row.classList.add('selected');
+    
+    const result = intruderResults[index];
+    if (result) {
+        document.getElementById('intruder-response-preview').innerText = result.error || 'No response data';
+    }
+}
+
+function stopIntruderAttack() {
+    sendMessage({action: 'intruder_stop'});
+}
+
+// ==================== UTILS ====================
+function showTab(tabName) {
+    document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+    document.getElementById('content-' + tabName).classList.add('active');
+    document.getElementById('tab-' + tabName).classList.add('active');
 }
 
 function copyContent(id) {
@@ -460,425 +1361,8 @@ function copyContent(id) {
     navigator.clipboard.writeText(el.innerText);
 }
 
-document.getElementById("clearRequestsBtn").onclick = async () => {
-    if (!confirm("Are you sure you want to clear all saved requests?")) return;
-    await fetch("/api/clear-requests", { method: "DELETE" });
-    loadTraffic();
-};
-
-startAutoRefresh();
-
-// ==================== REPEATER TAB ====================
-function sendToRepeater() {
-    if (!currentRequestData) {
-        alert("Select a request first!");
-        return;
-    }
-    
-    showTab('repeater');
-    
-    // Fill repeater form
-    document.getElementById("repeater-method").value = currentRequestData[0] || "GET";
-    document.getElementById("repeater-url").value = currentRequestData[1] || "";
-    document.getElementById("repeater-headers").value = currentRequestData[2] || "{}";
-    document.getElementById("repeater-body").value = currentRequestData[3] || "";
-}
-
-async function sendRepeaterRequest() {
-    const method = document.getElementById("repeater-method").value;
-    const url = document.getElementById("repeater-url").value;
-    let headers = {};
-    
-    try {
-        headers = JSON.parse(document.getElementById("repeater-headers").value);
-    } catch (e) {
-        alert("Invalid headers JSON!");
-        return;
-    }
-    
-    const body = document.getElementById("repeater-body").value;
-    
-    document.getElementById("repeater-status").innerHTML = '<span class="loader"></span> Sending...';
-    
-    try {
-        const res = await fetch("/api/repeater/send", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ method, url, headers, body })
-        });
-        
-        const data = await res.json();
-        
-        if (data.success) {
-            document.getElementById("repeater-status").innerHTML = '<span class="text-green-500">✓ Success</span>';
-            document.getElementById("repeater-status-code").innerText = data.data.status_code;
-            document.getElementById("repeater-time").innerText = data.data.elapsed_time + "s";
-            document.getElementById("repeater-size").innerText = data.data.size + " bytes";
-            
-            // Update all response tabs
-            updateResponseTabs(data.data.headers, data.data.body);
-        } else {
-            document.getElementById("repeater-status").innerHTML = '<span class="text-red-500">✗ Error: ' + data.data.error + '</span>';
-        }
-    } catch (e) {
-        document.getElementById("repeater-status").innerHTML = '<span class="text-red-500">✗ Request failed: ' + e.message + '</span>';
-        console.error("Repeater error:", e);
-    }
-}
-
-function clearRepeater() {
-    document.getElementById("repeater-url").value = "";
-    document.getElementById("repeater-headers").value = '{\n  "Content-Type": "application/json"\n}';
-    document.getElementById("repeater-body").value = "";
-    document.getElementById("repeater-response-headers").innerText = "";
-    document.getElementById("repeater-response-body").innerText = "";
-    document.getElementById("repeater-response-pretty").innerHTML = "";
-    document.getElementById("repeater-response-hex").innerText = "";
-    document.getElementById("repeater-response-render").srcdoc = "";
-    document.getElementById("repeater-status-code").innerText = "-";
-    document.getElementById("repeater-time").innerText = "-";
-    document.getElementById("repeater-size").innerText = "-";
-}
-
-function sendToIntruder() {
-    showTab('intruder');
-    document.getElementById("intruder-method").value = document.getElementById("repeater-method").value;
-    document.getElementById("intruder-url").value = document.getElementById("repeater-url").value;
-    document.getElementById("intruder-headers").value = document.getElementById("repeater-headers").value;
-    document.getElementById("intruder-body").value = document.getElementById("repeater-body").value;
-}
-
-// ==================== INTRUDER TAB ====================
-let intruderResults = [];
-
-async function loadPayloadPreset() {
-    const preset = document.getElementById("intruder-preset").value;
-    if (!preset) return;
-    
-    try {
-        const res = await fetch("/api/intruder/payloads/generate", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ payload_type: preset })
-        });
-        
-        const data = await res.json();
-        document.getElementById("intruder-payloads").value = data.payloads.join("\n");
-        document.getElementById("intruder-preset").value = "";
-    } catch (e) {
-        alert("Failed to load payloads");
-    }
-}
-
-async function startIntruderAttack() {
-    const attackType = document.getElementById("intruder-attack-type").value;
-    const method = document.getElementById("intruder-method").value;
-    const url = document.getElementById("intruder-url").value;
-    const body = document.getElementById("intruder-body").value;
-    const threads = parseInt(document.getElementById("intruder-threads").value) || 10;
-    
-    let headers = {};
-    try {
-        headers = JSON.parse(document.getElementById("intruder-headers").value);
-    } catch (e) {
-        alert("Invalid headers JSON!");
-        return;
-    }
-    
-    const payloadsText = document.getElementById("intruder-payloads").value;
-    const payloads = payloadsText.split("\n").filter(p => p.trim());
-    
-    if (payloads.length === 0) {
-        alert("Please enter payloads!");
-        return;
-    }
-    
-    // Clear previous results
-    document.getElementById("intruder-results").innerHTML = "";
-    document.getElementById("intruder-response-preview").innerText = "";
-    document.getElementById("intruder-summary").classList.add("hidden");
-    intruderResults = [];
-    
-    document.getElementById("intruder-start-btn").disabled = true;
-    document.getElementById("intruder-start-btn").innerText = "⏳ Running...";
-    document.getElementById("intruder-progress").innerText = "Starting attack...";
-    
-    try {
-        const res = await fetch("/api/intruder/attack", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                method,
-                url,
-                headers,
-                body,
-                attack_type: attackType,
-                payloads,
-                threads
-            })
-        });
-        
-        const data = await res.json();
-        intruderResults = data.results;
-        
-        // Display results
-        const tbody = document.getElementById("intruder-results");
-        data.results.forEach((r, i) => {
-            const tr = document.createElement("tr");
-            tr.className = "result-row border-b border-gray-800 cursor-pointer";
-            
-            let statusClass = "";
-            if(r.status_code >= 200 && r.status_code < 300) statusClass = "status-2xx";
-            else if(r.status_code >= 300 && r.status_code < 400) statusClass = "status-3xx";
-            else if(r.status_code >= 400 && r.status_code < 500) statusClass = "status-4xx";
-            else if(r.status_code >= 500) statusClass = "status-5xx";
-            
-            tr.innerHTML = `
-                <td class="p-2">${i + 1}</td>
-                <td class="p-2 truncate max-w-xs">${r.payload}</td>
-                <td class="p-2"><span class="badge ${statusClass}">${r.status_code || 'ERR'}</span></td>
-                <td class="p-2">${r.length}</td>
-                <td class="p-2">${r.time}s</td>
-            `;
-            
-            tr.onclick = () => showIntruderResult(i, tr);
-            tbody.appendChild(tr);
-        });
-        
-        // Show summary
-        document.getElementById("intruder-progress").innerText = `Completed: ${data.total_requests} requests`;
-        document.getElementById("intruder-summary").classList.remove("hidden");
-        
-        const summary = data.summary;
-        let summaryText = `Total: ${summary.total_requests} | `;
-        summaryText += `Errors: ${summary.errors} | `;
-        summaryText += `Avg Length: ${Math.round(summary.avg_length)} bytes | `;
-        summaryText += `Avg Time: ${summary.avg_time?.toFixed(3)}s`;
-        document.getElementById("intruder-summary-text").innerText = summaryText;
-        
-    } catch (e) {
-        document.getElementById("intruder-progress").innerText = "Attack failed: " + e.message;
-    }
-    
-    document.getElementById("intruder-start-btn").disabled = false;
-    document.getElementById("intruder-start-btn").innerText = "🚀 Start Attack";
-}
-
-async function showIntruderResult(index, row) {
-    // Highlight selected row
-    document.querySelectorAll('.result-row').forEach(r => r.classList.remove('selected'));
-    row.classList.add('selected');
-    
-    try {
-        const res = await fetch("/api/intruder/result/" + index);
-        const data = await res.json();
-        document.getElementById("intruder-response-preview").innerText = data.response_body || data.error || "No response";
-    } catch (e) {
-        document.getElementById("intruder-response-preview").innerText = "Failed to load response";
-    }
-}
-
-async function stopIntruderAttack() {
-    try {
-        await fetch("/api/intruder/stop", { method: "POST" });
-        document.getElementById("intruder-progress").innerText = "Attack stopped";
-    } catch (e) {
-        console.error("Failed to stop attack");
-    }
-}
-
-// ==================== TERMINAL ====================
-let terminalInitialized = false;
-let term = null;
-let ws = null;
-
-function initTerminal() {
-    if (terminalInitialized) return;
-    
-    term = new Terminal({
-        cols: 120,
-        rows: 20,
-        theme: {
-            background: '#000000',
-            foreground: '#00ff00'
-        }
-    });
-    term.open(document.getElementById("terminal"));
-
-    ws = new WebSocket(`ws://${location.host}/ws/terminal`);
-    term.write("Connecting to terminal...\r\n");
-
-    let currentCmd = "";
-    
-    ws.onopen = () => {
-        term.write("Connected!\r\n$ ");
-    };
-    
-    term.onKey(e => {
-        const char = e.key;
-
-        if (char === "\r") {
-            ws.send(currentCmd);
-            currentCmd = "";
-            term.write("\r\n");
-        } else if (e.domEvent.key === "Backspace") {
-            if (currentCmd.length > 0) {
-                currentCmd = currentCmd.slice(0, -1);
-                term.write("\b \b");
-            }
-        } else {
-            currentCmd += char;
-            term.write(char);
-        }
-    });
-
-    ws.onmessage = (event) => {
-        term.write(event.data + "\r\n$ ");
-        term.scrollToBottom();
-    };
-    
-    ws.onerror = () => {
-        term.write("\r\n[Connection error]\r\n");
-    };
-    
-    ws.onclose = () => {
-        term.write("\r\n[Disconnected]\r\n");
-    };
-    
-    terminalInitialized = true;
-}
-
-// ==================== RESPONSE TABS ====================
-let currentResponseBody = "";
-
-function showResponseTab(tabName) {
-    // Hide all response content
-    document.querySelectorAll('.response-tab-content').forEach(el => {
-        el.classList.add('hidden');
-        el.classList.remove('active');
-    });
-    document.querySelectorAll('.response-tab-btn').forEach(el => el.classList.remove('active'));
-    
-    // Show selected
-    const content = document.getElementById('response-content-' + tabName);
-    if (content) {
-        content.classList.remove('hidden');
-        content.classList.add('active');
-    }
-    document.getElementById('resp-tab-' + tabName).classList.add('active');
-}
-
-function updateResponseTabs(headers, body) {
-    currentResponseBody = body;
-    
-    // Headers tab
-    document.getElementById("repeater-response-headers").innerText = JSON.stringify(headers, null, 2);
-    
-    // Raw tab
-    document.getElementById("repeater-response-body").innerText = body;
-    
-    // Pretty tab (formatted JSON/XML/HTML)
-    document.getElementById("repeater-response-pretty").innerHTML = formatPretty(body, headers);
-    
-    // Render tab (HTML preview in iframe)
-    const iframe = document.getElementById("repeater-response-render");
-    iframe.srcdoc = body;
-    
-    // Hex tab
-    document.getElementById("repeater-response-hex").innerText = toHexView(body);
-}
-
-function formatPretty(body, headers) {
-    const contentType = headers['content-type'] || headers['Content-Type'] || '';
-    
-    // Try JSON
-    if (contentType.includes('json') || body.trim().startsWith('{') || body.trim().startsWith('[')) {
-        try {
-            const obj = JSON.parse(body);
-            return syntaxHighlightJSON(JSON.stringify(obj, null, 2));
-        } catch (e) {
-            // Not valid JSON
-        }
-    }
-    
-    // Try XML/HTML
-    if (contentType.includes('xml') || contentType.includes('html') || body.trim().startsWith('<')) {
-        return syntaxHighlightXML(formatXML(body));
-    }
-    
-    // Plain text
-    return escapeHtml(body);
-}
-
-function syntaxHighlightJSON(json) {
-    json = escapeHtml(json);
-    return json.replace(/("[^"]+"):/g, '<span class="json-key">$1</span>:')
-               .replace(/: ("[^"]*")/g, ': <span class="json-string">$1</span>')
-               .replace(/: (\d+)/g, ': <span class="json-number">$1</span>')
-               .replace(/: (true|false)/g, ': <span class="json-boolean">$1</span>')
-               .replace(/: (null)/g, ': <span class="json-null">$1</span>');
-}
-
-function syntaxHighlightXML(xml) {
-    xml = escapeHtml(xml);
-    return xml.replace(/(&lt;\/?)(\w+)/g, '$1<span class="xml-tag">$2</span>')
-              .replace(/(\w+)=("[^"]*")/g, '<span class="xml-attr">$1</span>=<span class="xml-value">$2</span>');
-}
-
-function formatXML(xml) {
-    let formatted = '';
-    let indent = '';
-    const tab = '  ';
-    
-    xml.split(/(<[^>]+>)/g).forEach(node => {
-        if (node.match(/^<\/\w/)) {
-            indent = indent.substring(tab.length);
-        }
-        formatted += indent + node + '\n';
-        if (node.match(/^<\w[^>]*[^\/]>$/)) {
-            indent += tab;
-        }
-    });
-    
-    return formatted.trim();
-}
-
-function toHexView(str) {
-    let hex = '';
-    let ascii = '';
-    let result = '';
-    let offset = 0;
-    
-    for (let i = 0; i < str.length; i++) {
-        const code = str.charCodeAt(i);
-        hex += code.toString(16).padStart(2, '0') + ' ';
-        ascii += (code >= 32 && code <= 126) ? str[i] : '.';
-        
-        if ((i + 1) % 16 === 0) {
-            result += offset.toString(16).padStart(8, '0') + '  ' + hex + ' |' + ascii + '|\n';
-            hex = '';
-            ascii = '';
-            offset += 16;
-        }
-    }
-    
-    // Last line
-    if (hex) {
-        result += offset.toString(16).padStart(8, '0') + '  ' + hex.padEnd(48, ' ') + ' |' + ascii + '|\n';
-    }
-    
-    return result;
-}
-
-function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-}
-
-// Initialize on page load
-loadTraffic();
-showResponseTab('headers');
+// Initialize
+connectWebSocket();
 </script>
 
 </body>
