@@ -293,6 +293,101 @@ def get_request_by_id(req_id):
     except:
         return None
 
+def parse_raw_request(raw):
+    """Parse raw HTTP request string into components"""
+    lines = raw.replace('\r\n', '\n').split('\n')
+    if not lines:
+        return {}
+    
+    # Parse first line: METHOD /path HTTP/1.1 OR METHOD https://host/path HTTP/1.1
+    first_line = lines[0].strip()
+    parts = first_line.split(' ')
+    method = parts[0] if len(parts) > 0 else 'GET'
+    path_or_url = parts[1] if len(parts) > 1 else '/'
+    
+    # Find where headers end and body begins
+    headers_list = []
+    body_start = -1
+    host = ''
+    
+    for i in range(1, len(lines)):
+        line = lines[i]
+        if line.strip() == '':
+            body_start = i + 1
+            break
+        headers_list.append(line)
+        if line.lower().startswith('host:'):
+            host = line.split(':', 1)[1].strip()
+    
+    # Reconstruct headers string
+    headers = '\n'.join(headers_list)
+    
+    # Get body
+    body = '\n'.join(lines[body_start:]) if body_start > 0 else ''
+    
+    # Build full URL from path and host
+    # Handle both path-only format (/path) and full-URL format (https://host/path)
+    if path_or_url.startswith(('http://', 'https://')):
+        # Full URL in request line - extract path from it
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(path_or_url)
+            path = parsed.path if parsed.path else '/'
+            if parsed.query:
+                path += '?' + parsed.query
+            # Use host from URL if not found in headers
+            if not host and parsed.hostname:
+                host = parsed.hostname
+        except:
+            path = '/'
+    else:
+        # Already a path
+        path = path_or_url
+    
+    # Build full URL for mitmproxy
+    if host:
+        url = f"https://{host}{path}"
+    else:
+        url = path_or_url  # Fallback to original if no host
+    
+    return {
+        'method': method,
+        'url': url,
+        'headers': headers,
+        'body': body
+    }
+
+def parse_raw_response(raw):
+    """Parse raw HTTP response string into components"""
+    lines = raw.split('\n')
+    if not lines:
+        return {}
+    
+    # Parse first line: HTTP/1.1 200 OK
+    # Status code is not needed for forwarding, but we keep it for completeness
+    
+    # Find where headers end and body begins
+    headers_list = []
+    body_start = -1
+    
+    for i in range(1, len(lines)):
+        line = lines[i]
+        if line.strip() == '':
+            body_start = i + 1
+            break
+        headers_list.append(line)
+    
+    # Reconstruct headers string
+    headers = '\n'.join(headers_list)
+    
+    # Get body
+    body = '\n'.join(lines[body_start:]) if body_start > 0 else ''
+    
+    return {
+        'headers': headers,
+        'body': body
+    }
+
 def forward_all_pending_intercepts():
     """Forward all pending intercepts"""
     conn = sqlite3.connect(DB_FILE)
@@ -300,6 +395,111 @@ def forward_all_pending_intercepts():
     c.execute("UPDATE intercept_queue SET status = 'forward' WHERE status = 'pending'")
     conn.commit()
     conn.close()
+
+def capitalize_header_name(header_name):
+    """Capitalize HTTP header names properly (e.g., 'content-type' -> 'Content-Type')"""
+    # Special cases for common headers
+    special_cases = {
+        'www-authenticate': 'WWW-Authenticate',
+        'x-xss-protection': 'X-XSS-Protection',
+        'x-webkit-csp': 'X-WebKit-CSP',
+        'x-dns-prefetch-control': 'X-DNS-Prefetch-Control',
+        'x-frame-options': 'X-Frame-Options',
+        'x-content-type-options': 'X-Content-Type-Options',
+        'x-powered-by': 'X-Powered-By',
+        'x-ua-compatible': 'X-UA-Compatible',
+        'x-request-id': 'X-Request-ID',
+        'x-correlation-id': 'X-Correlation-ID',
+        'x-real-ip': 'X-Real-IP',
+        'x-forwarded-for': 'X-Forwarded-For',
+        'x-forwarded-host': 'X-Forwarded-Host',
+        'x-forwarded-proto': 'X-Forwarded-Proto',
+        'x-csrf-token': 'X-CSRF-Token',
+        'x-xsrf-token': 'X-XSRF-Token',
+        'x-api-key': 'X-API-Key',
+        'x-auth-token': 'X-Auth-Token',
+        'accept-ch': 'Accept-CH',
+        'accept-ch-lifetime': 'Accept-CH-Lifetime',
+        'dnt': 'DNT',
+        'ect': 'ECT',
+        'etag': 'ETag',
+        'last-event-id': 'Last-Event-ID',
+        'nel': 'NEL',
+        'sec-ch-ua': 'Sec-CH-UA',
+        'sec-ch-ua-arch': 'Sec-CH-UA-Arch',
+        'sec-ch-ua-bitness': 'Sec-CH-UA-Bitness',
+        'sec-ch-ua-full-version': 'Sec-CH-UA-Full-Version',
+        'sec-ch-ua-full-version-list': 'Sec-CH-UA-Full-Version-List',
+        'sec-ch-ua-mobile': 'Sec-CH-UA-Mobile',
+        'sec-ch-ua-model': 'Sec-CH-UA-Model',
+        'sec-ch-ua-platform': 'Sec-CH-UA-Platform',
+        'sec-ch-ua-platform-version': 'Sec-CH-UA-Platform-Version',
+        'sec-fetch-dest': 'Sec-Fetch-Dest',
+        'sec-fetch-mode': 'Sec-Fetch-Mode',
+        'sec-fetch-site': 'Sec-Fetch-Site',
+        'sec-fetch-user': 'Sec-Fetch-User',
+        'sec-websocket-accept': 'Sec-WebSocket-Accept',
+        'sec-websocket-extensions': 'Sec-WebSocket-Extensions',
+        'sec-websocket-key': 'Sec-WebSocket-Key',
+        'sec-websocket-protocol': 'Sec-WebSocket-Protocol',
+        'sec-websocket-version': 'Sec-WebSocket-Version',
+        'www-authenticate': 'WWW-Authenticate',
+        'content-md5': 'Content-MD5',
+        'content-sha256': 'Content-SHA256',
+    }
+    
+    lower_name = header_name.lower()
+    if lower_name in special_cases:
+        return special_cases[lower_name]
+    
+    # General rule: capitalize first letter of each word
+    return '-'.join(word.capitalize() for word in header_name.split('-'))
+
+def build_raw_request(flow_request):
+    """Build properly formatted raw HTTP request"""
+    # Build request line with path only (not full URL)
+    # This is the standard HTTP/1.1 format
+    path = flow_request.path if flow_request.path else '/'
+    raw_request = f"{flow_request.method} {path} HTTP/1.1\r\n"
+    
+    # Ensure Host header is first and properly formatted
+    host = flow_request.host
+    if host:
+        raw_request += f"Host: {host}\r\n"
+    
+    # Add other headers with proper capitalization
+    for header_name, header_value in flow_request.headers.items():
+        # Skip Host header as we already added it
+        if header_name.lower() == 'host':
+            continue
+        
+        # Capitalize header name properly
+        capitalized_name = capitalize_header_name(header_name)
+        raw_request += f"{capitalized_name}: {header_value}\r\n"
+    
+    # Add body if present
+    body = flow_request.text if flow_request.text else ""
+    if body:
+        raw_request += f"\r\n{body}"
+    
+    return raw_request
+
+def build_raw_response(flow_response):
+    """Build properly formatted raw HTTP response"""
+    # Build status line
+    raw_response = f"HTTP/1.1 {flow_response.status_code} {flow_response.reason}\r\n"
+    
+    # Add headers with proper capitalization
+    for header_name, header_value in flow_response.headers.items():
+        capitalized_name = capitalize_header_name(header_name)
+        raw_response += f"{capitalized_name}: {header_value}\r\n"
+    
+    # Add body if present
+    body = flow_response.text if flow_response.text else ""
+    if body:
+        raw_response += f"\r\n{body}"
+    
+    return raw_response
 
 def set_request_intercept_response(req_id, intercept_response):
     """Mark a request to have its response intercepted"""
@@ -640,7 +840,15 @@ async def websocket_endpoint(websocket: WebSocket):
             
             elif action == 'forward_request':
                 req_id = data.get('id')
-                modified = data.get('request', {})
+                request_raw = data.get('request', '')
+                # Parse raw HTTP request
+                parsed = parse_raw_request(request_raw)
+                modified = {
+                    'method': parsed.get('method'),
+                    'url': parsed.get('url'),
+                    'headers': parsed.get('headers'),
+                    'body': parsed.get('body')
+                }
                 update_intercept_status(req_id, 'forward', modified)
                 await manager.send_personal_message({'type': 'forwarded', 'id': req_id}, websocket)
             
@@ -651,7 +859,13 @@ async def websocket_endpoint(websocket: WebSocket):
             
             elif action == 'forward_response':
                 resp_id = data.get('id')
-                modified = data.get('response', {})
+                response_raw = data.get('response', '')
+                # Parse raw HTTP response
+                parsed = parse_raw_response(response_raw)
+                modified = {
+                    'headers': parsed.get('headers'),
+                    'body': parsed.get('body')
+                }
                 update_intercept_status(resp_id, 'forward', response_modified=modified)
                 await manager.send_personal_message({'type': 'forwarded', 'id': resp_id}, websocket)
             
@@ -662,9 +876,18 @@ async def websocket_endpoint(websocket: WebSocket):
             
             elif action == 'forward_all':
                 requests_list = data.get('requests', [])
-                for req in requests_list:
-                    req_id = req.get('id')
-                    update_intercept_status(req_id, 'forward', req)
+                for req_data in requests_list:
+                    req_id = req_data.get('id')
+                    request_raw = req_data.get('request', '')
+                    # Parse raw HTTP request
+                    parsed = parse_raw_request(request_raw)
+                    modified = {
+                        'method': parsed.get('method'),
+                        'url': parsed.get('url'),
+                        'headers': parsed.get('headers'),
+                        'body': parsed.get('body')
+                    }
+                    update_intercept_status(req_id, 'forward', modified)
                 await manager.send_personal_message({'type': 'queue_cleared'}, websocket)
             
             elif action == 'drop_all':
@@ -952,16 +1175,15 @@ if MITMPROXY_AVAILABLE:
             self.url_method_to_req_id[url_method_key] = req_id
             print(f"[DEBUG] Intercepted request {req_id} for {url_method_key}")
             
-            # Build raw request
-            raw_request = f"{flow.request.method} {flow.request.path} HTTP/1.1\n"
-            headers_dict = dict(flow.request.headers)
+            # Build raw request with proper formatting
+            raw_request = build_raw_request(flow.request)
+            
+            # Build headers string for database (also properly formatted)
             headers_str = ""
-            for k, v in headers_dict.items():
-                raw_request += f"{k}: {v}\n"
-                headers_str += f"{k}: {v}\n"
+            for header_name, header_value in flow.request.headers.items():
+                capitalized_name = capitalize_header_name(header_name)
+                headers_str += f"{capitalized_name}: {header_value}\n"
             body = flow.request.text if flow.request.text else ""
-            if body:
-                raw_request += f"\n{body}"
             
             # Add to database queue
             add_to_intercept_queue(
@@ -1020,16 +1242,15 @@ if MITMPROXY_AVAILABLE:
                 # Generate a unique response ID
                 resp_id = str(uuid.uuid4())
                 
-                # Build raw response
-                raw_response = f"HTTP/1.1 {flow.response.status_code} {flow.response.reason}\n"
-                headers_dict = dict(flow.response.headers)
+                # Build raw response with proper formatting
+                raw_response = build_raw_response(flow.response)
+                
+                # Build headers string for database (also properly formatted)
                 headers_str = ""
-                for k, v in headers_dict.items():
-                    raw_response += f"{k}: {v}\n"
-                    headers_str += f"{k}: {v}\n"
+                for header_name, header_value in flow.response.headers.items():
+                    capitalized_name = capitalize_header_name(header_name)
+                    headers_str += f"{capitalized_name}: {header_value}\n"
                 body = flow.response.text if flow.response.text else ""
-                if body:
-                    raw_response += f"\n{body}"
                 
                 # Add response to database queue
                 add_response_to_queue(
