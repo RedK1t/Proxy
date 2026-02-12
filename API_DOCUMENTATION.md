@@ -135,9 +135,9 @@ The interceptor catches HTTP requests before they go to the server. You can:
     "method": "GET",
     "url": "https://example.com/api/users",
     "host": "example.com",
-    "headers": "Content-Type: application/json\nAuthorization: Bearer token123",
+    "headers": "Host: example.com\nUser-Agent: Mozilla/5.0\nAccept: application/json\nAuthorization: Bearer token123",
     "body": "{\"name\": \"John\"}",
-    "raw": "GET /api/users HTTP/1.1\nHost: example.com\nContent-Type: application/json\n\n{\"name\": \"John\"}"
+    "raw": "GET /api/users HTTP/1.1\r\nHost: example.com\r\nUser-Agent: Mozilla/5.0\r\nAccept: application/json\r\nAuthorization: Bearer token123\r\n\r\n{\"name\": \"John\"}"
 }
 ```
 
@@ -146,9 +146,9 @@ The interceptor catches HTTP requests before they go to the server. You can:
 - `method`: HTTP method (GET, POST, PUT, DELETE, etc.)
 - `url`: Full URL the request is going to
 - `host`: The domain name
-- `headers`: HTTP headers as a string
+- `headers`: HTTP headers as a string with proper capitalization (Host, User-Agent, Content-Type, etc.)
 - `body`: The request body (for POST/PUT requests)
-- `raw`: The complete HTTP request as it would appear on the wire
+- `raw`: The complete HTTP request as it would appear on the wire with proper formatting
 
 ---
 
@@ -166,16 +166,16 @@ The interceptor catches HTTP requests before they go to the server. You can:
     "url": "https://example.com/api/users",
     "host": "example.com",
     "status_code": 200,
-    "response_headers": "Content-Type: application/json\nServer: nginx",
+    "response_headers": "Date: Thu, 12 Feb 2026 13:41:00 GMT\nServer: nginx\nContent-Type: application/json\nContent-Length: 42",
     "response_body": "{\"users\": [{\"id\": 1, \"name\": \"John\"}]}",
-    "raw_response": "HTTP/1.1 200 OK\nContent-Type: application/json\n\n{\"users\": [{\"id\": 1, \"name\": \"John\"}]}",
+    "raw_response": "HTTP/1.1 200 OK\r\nDate: Thu, 12 Feb 2026 13:41:00 GMT\r\nServer: nginx\r\nContent-Type: application/json\r\nContent-Length: 42\r\n\r\n{\"users\": [{\"id\": 1, \"name\": \"John\"}]}",
     "parent_request": {
         "method": "GET",
         "url": "https://example.com/api/users",
         "host": "example.com",
-        "headers": "Accept: application/json",
+        "headers": "Host: example.com\nUser-Agent: Mozilla/5.0\nAccept: application/json",
         "body": "",
-        "raw": "GET /api/users HTTP/1.1\nHost: example.com\nAccept: application/json"
+        "raw": "GET /api/users HTTP/1.1\r\nHost: example.com\r\nUser-Agent: Mozilla/5.0\r\nAccept: application/json"
     }
 }
 ```
@@ -184,9 +184,9 @@ The interceptor catches HTTP requests before they go to the server. You can:
 - `id`: Unique identifier for this response
 - `parent_id`: The ID of the request that caused this response
 - `status_code`: HTTP status (200 = OK, 404 = Not Found, 500 = Server Error, etc.)
-- `response_headers`: Response headers as a string
+- `response_headers`: Response headers as a string with proper capitalization
 - `response_body`: The response body (HTML, JSON, etc.)
-- `raw_response`: Complete HTTP response as it appears on the wire
+- `raw_response`: Complete HTTP response as it appears on the wire with proper formatting
 - `parent_request`: The original request data (useful for showing both side-by-side)
 
 ---
@@ -200,14 +200,11 @@ The interceptor catches HTTP requests before they go to the server. You can:
 {
     "action": "forward_request",
     "id": "uuid-of-request",
-    "request": {
-        "method": "POST",
-        "url": "https://example.com/api/users",
-        "headers": "Content-Type: application/json\nAuthorization: Bearer token",
-        "body": "{\"name\": \"Modified Name\"}"
-    }
+    "request": "GET / HTTP/1.1\nHost: ma-quiz.pages.dev\nUser-Agent: Mozilla/5.0\nAccept: text/html\n\n"
 }
 ```
+
+**Note:** The request line should use the path format (`GET / HTTP/1.1`) not the full URL format (`GET https://host/ HTTP/1.1`). The Host header determines the destination.
 
 **Receive from Backend:**
 ```javascript
@@ -217,7 +214,7 @@ The interceptor catches HTTP requests before they go to the server. You can:
 }
 ```
 
-**Explanation:** You can modify the request before forwarding! Change the URL, headers, or body.
+**Explanation:** You can modify the request before forwarding! The request is sent as a single raw HTTP string. The backend parses it automatically.
 
 ---
 
@@ -230,11 +227,7 @@ The interceptor catches HTTP requests before they go to the server. You can:
 {
     "action": "forward_response",
     "id": "uuid-of-response",
-    "response": {
-        "status_code": 200,
-        "headers": "Content-Type: application/json",
-        "body": "{\"modified\": \"data\"}"
-    }
+    "response": "HTTP/1.1 200 OK\nContent-Type: application/json\n\n{\"modified\": \"data\"}"
 }
 ```
 
@@ -246,7 +239,7 @@ The interceptor catches HTTP requests before they go to the server. You can:
 }
 ```
 
-**Explanation:** Modify the response before sending it to the browser. You can change status codes, headers, and body.
+**Explanation:** Modify the response before sending it to the browser. The response is sent as a single raw HTTP string. The backend parses it automatically.
 
 ---
 
@@ -307,17 +300,11 @@ The interceptor catches HTTP requests before they go to the server. You can:
     "requests": [
         {
             "id": "uuid-1",
-            "method": "GET",
-            "url": "https://example.com/page1",
-            "headers": "...",
-            "body": "..."
+            "request": "GET /page1 HTTP/1.1\nHost: example.com\n\n"
         },
         {
             "id": "uuid-2",
-            "method": "POST",
-            "url": "https://example.com/page2",
-            "headers": "...",
-            "body": "..."
+            "request": "POST /page2 HTTP/1.1\nHost: example.com\nContent-Type: application/json\n\n{\"key\": \"value\"}"
         }
     ]
 }
@@ -329,6 +316,8 @@ The interceptor catches HTTP requests before they go to the server. You can:
     "type": "queue_cleared"
 }
 ```
+
+**Explanation:** Each request in the array is sent as a single raw HTTP string. The backend parses each request automatically.
 
 ---
 
@@ -452,12 +441,7 @@ ws.onmessage = (event) => {
         ws.send(JSON.stringify({
             action: 'forward_request',
             id: msg.id,
-            request: {
-                method: msg.method,
-                url: msg.url,
-                headers: msg.headers,
-                body: msg.body
-            }
+            request: msg.raw
         }));
     }
 };
@@ -491,12 +475,7 @@ ws.onmessage = (event) => {
         ws.send(JSON.stringify({
             action: 'forward_request',
             id: msg.id,
-            request: {
-                method: msg.method,
-                url: msg.url,
-                headers: msg.headers,
-                body: msg.body
-            }
+            request: msg.raw
         }));
     }
     
@@ -507,16 +486,13 @@ ws.onmessage = (event) => {
         console.log('Response Body:', msg.response_body);
         
         // 4. Modify and forward the response
-        const modifiedBody = msg.response_body.replace('John', 'Jane');
+        let modifiedResponse = msg.raw_response;
+        modifiedResponse = modifiedResponse.replace('John', 'Jane');
         
         ws.send(JSON.stringify({
             action: 'forward_response',
             id: msg.id,
-            response: {
-                status_code: msg.status_code,
-                headers: msg.response_headers,
-                body: modifiedBody
-            }
+            response: modifiedResponse
         }));
     }
 };

@@ -998,47 +998,28 @@ function forwardRequest() {
     const isSplitPane = !document.getElementById('split-editor-pane').classList.contains('hidden');
 
     if (isSplitPane && item.itemType === 'response') {
-        // Forward response from split pane
+        // Forward response from split pane - send raw format
         const responseRaw = document.getElementById('intercept-response-editor').value;
-        const parsed = parseRawResponse(responseRaw);
         sendMessage({
             action: 'forward_response',
             id: item.id,
-            response: {
-                status_code: parsed.statusCode,
-                headers: parsed.headers,
-                body: parsed.body
-            }
+            response: responseRaw
         });
     } else if (item.itemType === 'response') {
-        // Forward response from single pane (fallback)
-        const raw = document.getElementById('intercept-editor').value;
-        const parsed = parseRawResponse(raw);
+        // Forward response from single pane (fallback) - send raw format
+        const responseRaw = document.getElementById('intercept-editor').value;
         sendMessage({
             action: 'forward_response',
             id: item.id,
-            response: {
-                status_code: parsed.statusCode,
-                headers: parsed.headers,
-                body: parsed.body
-            }
+            response: responseRaw
         });
     } else {
-        // Forward request
-        const raw = document.getElementById('intercept-editor').value;
-        const parsed = parseRawRequest(raw);
-        const url = new URL(item.url);
-        const newUrl = `${url.protocol}//${url.hostname}${parsed.path}`;
-
+        // Forward request - send raw format
+        const requestRaw = document.getElementById('intercept-editor').value;
         sendMessage({
             action: 'forward_request',
             id: item.id,
-            request: {
-                method: parsed.method,
-                url: newUrl,
-                headers: parsed.headers,
-                body: parsed.body
-            }
+            request: requestRaw
         });
     }
 }
@@ -1089,14 +1070,20 @@ function dropRequest() {
 function forwardAll() {
     if (interceptQueue.length === 0) return;
     
-    // Store the requests to forward
-    const requestsToForward = interceptQueue.map(r => ({
-        id: r.id,
-        method: r.method,
-        url: r.url,
-        headers: r.headers,
-        body: r.body
-    }));
+    // Store the requests to forward with raw format
+    const requestsToForward = interceptQueue.filter(r => r.itemType !== 'response').map(r => {
+        // Get the current raw value from editor if it's the selected item
+        let raw;
+        if (interceptQueue[selectedInterceptIndex] && interceptQueue[selectedInterceptIndex].id === r.id) {
+            raw = document.getElementById('intercept-editor').value;
+        } else {
+            raw = r.raw || buildRawRequest(r);
+        }
+        return {
+            id: r.id,
+            request: raw
+        };
+    });
     
     // Immediately clear the local queue to prevent UI inconsistencies
     interceptQueue = [];
