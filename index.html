@@ -1070,18 +1070,29 @@ function dropRequest() {
 function forwardAll() {
     if (interceptQueue.length === 0) return;
     
-    // Store the requests to forward with raw format
-    const requestsToForward = interceptQueue.filter(r => r.itemType !== 'response').map(r => {
-        // Get the current raw value from editor if it's the selected item
+    // Store all items (requests and responses) to forward
+    const itemsToForward = interceptQueue.map(item => {
         let raw;
-        if (interceptQueue[selectedInterceptIndex] && interceptQueue[selectedInterceptIndex].id === r.id) {
-            raw = document.getElementById('intercept-editor').value;
+        // If this item is currently selected, get the latest content from the relevant editor
+        if (selectedInterceptIndex !== -1 && interceptQueue[selectedInterceptIndex].id === item.id) {
+            if (item.itemType === 'response') {
+                raw = document.getElementById('intercept-response-editor').value;
+            } else {
+                raw = document.getElementById('intercept-editor').value;
+            }
         } else {
-            raw = r.raw || buildRawRequest(r);
+            // Otherwise use the stored raw content or rebuild it
+            if (item.itemType === 'response') {
+                raw = item.raw || buildRawResponse(item);
+            } else {
+                raw = item.raw || buildRawRequest(item);
+            }
         }
+
         return {
-            id: r.id,
-            request: raw
+            id: item.id,
+            type: item.itemType,
+            raw: raw
         };
     });
     
@@ -1093,7 +1104,7 @@ function forwardAll() {
     
     sendMessage({
         action: 'forward_all',
-        requests: requestsToForward
+        items: itemsToForward
     });
 }
 

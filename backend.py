@@ -875,19 +875,30 @@ async def websocket_endpoint(websocket: WebSocket):
                 await manager.send_personal_message({'type': 'dropped', 'id': resp_id}, websocket)
             
             elif action == 'forward_all':
-                requests_list = data.get('requests', [])
-                for req_data in requests_list:
-                    req_id = req_data.get('id')
-                    request_raw = req_data.get('request', '')
-                    # Parse raw HTTP request
-                    parsed = parse_raw_request(request_raw)
-                    modified = {
-                        'method': parsed.get('method'),
-                        'url': parsed.get('url'),
-                        'headers': parsed.get('headers'),
-                        'body': parsed.get('body')
-                    }
-                    update_intercept_status(req_id, 'forward', modified)
+                items_list = data.get('items', [])
+                for item_data in items_list:
+                    item_id = item_data.get('id')
+                    item_type = item_data.get('type', 'request')
+                    raw_content = item_data.get('raw', '')
+                    
+                    if item_type == 'response':
+                        # Parse raw HTTP response
+                        parsed = parse_raw_response(raw_content)
+                        modified = {
+                            'headers': parsed.get('headers'),
+                            'body': parsed.get('body')
+                        }
+                        update_intercept_status(item_id, 'forward', response_modified=modified)
+                    else:
+                        # Parse raw HTTP request
+                        parsed = parse_raw_request(raw_content)
+                        modified = {
+                            'method': parsed.get('method'),
+                            'url': parsed.get('url'),
+                            'headers': parsed.get('headers'),
+                            'body': parsed.get('body')
+                        }
+                        update_intercept_status(item_id, 'forward', modified)
                 await manager.send_personal_message({'type': 'queue_cleared'}, websocket)
             
             elif action == 'drop_all':

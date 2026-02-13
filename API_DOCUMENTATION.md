@@ -291,20 +291,22 @@ The interceptor catches HTTP requests before they go to the server. You can:
 
 ### 10. Forward All
 
-**Purpose:** Forward all pending requests at once
+**Purpose:** Forward all pending items (requests and responses) at once
 
 **Send to Backend:**
 ```javascript
 {
     "action": "forward_all",
-    "requests": [
+    "items": [
         {
             "id": "uuid-1",
-            "request": "GET /page1 HTTP/1.1\nHost: example.com\n\n"
+            "type": "request",
+            "raw": "GET /page1 HTTP/1.1\nHost: example.com\n\n"
         },
         {
             "id": "uuid-2",
-            "request": "POST /page2 HTTP/1.1\nHost: example.com\nContent-Type: application/json\n\n{\"key\": \"value\"}"
+            "type": "response",
+            "raw": "HTTP/1.1 200 OK\nContent-Type: text/html\n\n<html>Body</html>"
         }
     ]
 }
@@ -317,7 +319,7 @@ The interceptor catches HTTP requests before they go to the server. You can:
 }
 ```
 
-**Explanation:** Each request in the array is sent as a single raw HTTP string. The backend parses each request automatically.
+**Explanation:** Each item in the array includes its ID, type ('request' or 'response'), and the raw HTTP content. The backend parses each item based on its type automatically.
 
 ---
 
