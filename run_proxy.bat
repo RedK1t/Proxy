@@ -22,7 +22,7 @@ if exist "%VENV_MITMDUMP%" (
 start "RedKit Backend" cmd /k ""%PY_CMD%" backend.py"
 
 :: Start mitmdump with the backend script in a new window
-start "RedKit MitmDump" cmd /k ""%MITM_CMD%" -s backend.py -p 8080"
+start "RedKit MitmDump" cmd /k ""%MITM_CMD%" -s backend.py -p 8080 --ssl-insecure"
 
 echo Proxy components are starting in separate windows...
 pause
