@@ -19,6 +19,8 @@ import re
 import datetime
 import uuid
 import threading
+import itertools
+import fnmatch
 
 # Mitmproxy imports
 try:
@@ -113,7 +115,28 @@ def init_database():
     # Initialize intercept settings
     c.execute("INSERT OR REPLACE INTO intercept_settings (key, value) VALUES ('enabled', 'false')")
     c.execute("INSERT OR REPLACE INTO intercept_settings (key, value) VALUES ('response_enabled', 'false')")
-    
+
+    # Scope rules table: target-scope include/exclude patterns + excluded extensions
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS scope_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_type TEXT,
+            pattern TEXT,
+            UNIQUE(rule_type, pattern)
+        )
+    """)
+
+    # Scope toggles persist across restarts (INSERT OR IGNORE keeps the user's choice)
+    c.execute("INSERT OR IGNORE INTO intercept_settings (key, value) VALUES ('scope_enabled', 'false')")
+    c.execute("INSERT OR IGNORE INTO intercept_settings (key, value) VALUES ('extension_exclude_enabled', 'true')")
+
+    # Seed default excluded extensions exactly once (so the user can delete them later)
+    c.execute("SELECT value FROM intercept_settings WHERE key = 'extensions_seeded'")
+    if not c.fetchone():
+        for ext in ['js', 'css', 'html', 'jpg', 'png', 'gif', 'svg', 'ico', 'woff', 'woff2', 'ttf']:
+            c.execute("INSERT OR IGNORE INTO scope_rules (rule_type, pattern) VALUES ('extension', ?)", (ext,))
+        c.execute("INSERT OR REPLACE INTO intercept_settings (key, value) VALUES ('extensions_seeded', 'true')")
+
     conn.commit()
     conn.close()
 
@@ -161,6 +184,116 @@ def set_response_intercept_enabled(enabled: bool):
               ('true' if enabled else 'false',))
     conn.commit()
     conn.close()
+
+# ---------- Scope settings & rules (IPC via SQLite) ----------
+def _get_setting(key, default='false'):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT value FROM intercept_settings WHERE key = ?", (key,))
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row else default
+    except Exception:
+        return default
+
+def _set_setting(key, value):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO intercept_settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
+
+def is_scope_enabled():
+    return _get_setting('scope_enabled') == 'true'
+
+def set_scope_enabled(enabled):
+    _set_setting('scope_enabled', 'true' if enabled else 'false')
+
+def is_extension_exclude_enabled():
+    return _get_setting('extension_exclude_enabled') == 'true'
+
+def set_extension_exclude_enabled(enabled):
+    _set_setting('extension_exclude_enabled', 'true' if enabled else 'false')
+
+def get_scope_rules(rule_type):
+    """Return just the patterns for a rule type ('include' | 'exclude' | 'extension')."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT pattern FROM scope_rules WHERE rule_type = ? ORDER BY id", (rule_type,))
+        rows = [r[0] for r in c.fetchall()]
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+def get_scope_rules_with_ids(rule_type):
+    """Return [{id, pattern}, ...] for the UI."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id, pattern FROM scope_rules WHERE rule_type = ? ORDER BY id", (rule_type,))
+        rows = [{'id': r[0], 'pattern': r[1]} for r in c.fetchall()]
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+def add_scope_rule(rule_type, pattern):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO scope_rules (rule_type, pattern) VALUES (?, ?)", (rule_type, pattern))
+    conn.commit()
+    conn.close()
+
+def remove_scope_rule(rule_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM scope_rules WHERE id = ?", (rule_id,))
+    conn.commit()
+    conn.close()
+
+def get_full_scope():
+    """Full scope snapshot sent to the dashboard."""
+    return {
+        'enabled': is_scope_enabled(),
+        'extension_enabled': is_extension_exclude_enabled(),
+        'include': get_scope_rules_with_ids('include'),
+        'exclude': get_scope_rules_with_ids('exclude'),
+        'extensions': get_scope_rules_with_ids('extension'),
+    }
+
+def _pattern_matches(pattern, text):
+    """Match as RegEx; if the pattern isn't valid regex, fall back to glob wildcards."""
+    try:
+        return re.search(pattern, text, re.IGNORECASE) is not None
+    except re.error:
+        return fnmatch.fnmatch(text.lower(), pattern.lower())
+
+def _path_extension(path):
+    """Extract a file extension from a request path (ignoring query/fragment)."""
+    path = path.split('?')[0].split('#')[0]
+    last = path.rsplit('/', 1)[-1]
+    if '.' in last:
+        return last.rsplit('.', 1)[-1].lower()
+    return ''
+
+def is_flow_in_scope(url, path):
+    """Apply extension-exclude + target-scope rules. Returns False to skip the flow."""
+    if is_extension_exclude_enabled():
+        ext = _path_extension(path)
+        if ext and ext in [e.lower() for e in get_scope_rules('extension')]:
+            return False
+    if is_scope_enabled():
+        includes = get_scope_rules('include')
+        excludes = get_scope_rules('exclude')
+        # An empty include list means "everything is in scope" (Burp behaviour).
+        if includes and not any(_pattern_matches(p, url) for p in includes):
+            return False
+        if any(_pattern_matches(p, url) for p in excludes):
+            return False
+    return True
 
 def add_to_intercept_queue(req_id, method, url, host, headers, body, raw_request):
     """Add request to intercept queue"""
@@ -388,6 +521,50 @@ def parse_raw_response(raw):
         'body': body
     }
 
+def parse_raw_http_request(raw, scheme='https', default_host=''):
+    """Parse a raw HTTP request (Burp-style) into method, url, headers dict, and body.
+
+    Used by the Repeater so the user can edit the full request on the wire.
+    The destination is built from the request-line path plus the Host header
+    (or an explicit target override via `scheme`/`default_host`).
+    """
+    raw = raw.replace('\r\n', '\n').replace('\r', '\n')
+    lines = raw.split('\n')
+    if not lines or not lines[0].strip():
+        return None
+
+    parts = lines[0].strip().split(' ')
+    method = parts[0] if parts else 'GET'
+    path = parts[1] if len(parts) > 1 else '/'
+
+    headers = {}
+    host = ''
+    body_start = len(lines)
+    for i in range(1, len(lines)):
+        if lines[i].strip() == '':
+            body_start = i + 1
+            break
+        if ':' in lines[i]:
+            k, v = lines[i].split(':', 1)
+            k = k.strip()
+            v = v.strip()
+            if not k:
+                continue
+            headers[k] = v
+            if k.lower() == 'host':
+                host = v
+
+    body = '\n'.join(lines[body_start:]) if body_start < len(lines) else ''
+
+    # Build the full URL. A request line may carry a full URL (proxy form) or just a path.
+    if path.startswith(('http://', 'https://')):
+        url = path
+    else:
+        target_host = default_host or host
+        url = f"{scheme}://{target_host}{path}"
+
+    return {'method': method, 'url': url, 'headers': headers, 'body': body, 'host': host}
+
 def forward_all_pending_intercepts():
     """Forward all pending intercepts"""
     conn = sqlite3.connect(DB_FILE)
@@ -551,130 +728,154 @@ class PayloadGenerator:
     
     @staticmethod
     def path_traversal_payloads():
-        return ["../", "../../", "../../../etc/passwd"]
-    
+        return ["../", "../../", "../../../etc/passwd", "..%2f..%2f..%2fetc%2fpasswd",
+                "....//....//etc/passwd", "/etc/passwd", "C:\\Windows\\win.ini"]
+
+    @staticmethod
+    def directories():
+        return ["admin", "login", "dashboard", "api", "uploads", "backup", "config",
+                "test", ".git", ".env", "robots.txt", "wp-admin", "phpmyadmin"]
+
+    @staticmethod
+    def fuzz():
+        return ["'", "\"", "<", ">", "`", ";", "|", "&&", "${{7*7}}", "{{7*7}}",
+                "%00", "../", "$(id)", "\n", "\r\n"]
+
+    @staticmethod
+    def http_methods():
+        return ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT"]
+
     @staticmethod
     def numbers(start, end, step=1):
         return [str(i) for i in range(start, end + 1, step)]
 
-# Intruder
+# Intruder (Burp-style: raw request template with § positions, 4 attack types)
 class Intruder:
     POSITION_MARKER = "§"
-    
+
     def __init__(self, threads=10):
         self.threads = threads
         self.results = []
-        self.session = requests.Session()
         self.stop_flag = False
-    
+
     def find_positions(self, template):
+        """Return (start, end, default_value) for each §...§ marker pair."""
         pattern = re.compile(f'{self.POSITION_MARKER}(.*?){self.POSITION_MARKER}')
         return [(m.start(), m.end(), m.group(1)) for m in pattern.finditer(template)]
-    
-    def replace_position(self, template, pos_idx, payload):
-        positions = self.find_positions(template)
-        if pos_idx >= len(positions):
-            return template
-        result = template
-        for i, (start, end, _) in enumerate(reversed(positions)):
-            actual = len(positions) - 1 - i
-            if actual == pos_idx:
-                result = result[:start] + payload + result[end:]
-            else:
-                result = result[:start] + positions[actual][2] + result[end:]
-        return result
-    
-    def replace_all_positions(self, template, payload):
-        pattern = re.compile(f'{self.POSITION_MARKER}(.*?){self.POSITION_MARKER}')
-        return pattern.sub(payload, template)
-    
-    def attack_sniper(self, template, payloads):
+
+    def render(self, template, position_values):
+        """Replace each marker (in order) with the matching value from position_values."""
+        out = []
+        last = 0
+        idx = 0
+        for m in re.finditer(f'{self.POSITION_MARKER}(.*?){self.POSITION_MARKER}', template):
+            out.append(template[last:m.start()])
+            value = position_values[idx] if idx < len(position_values) else m.group(1)
+            out.append(value if value is not None else m.group(1))
+            last = m.end()
+            idx += 1
+        out.append(template[last:])
+        return ''.join(out)
+
+    def _build_jobs(self, attack_type, defaults, payload_sets):
+        """Build the list of (position_values, label) tuples for the chosen attack type."""
+        n = len(defaults)
+        jobs = []
+        set0 = payload_sets[0] if payload_sets else []
+
+        if n == 0:
+            return [([], '')]
+
+        if attack_type == 'battering_ram':
+            for payload in set0:
+                jobs.append(([payload] * n, payload))
+        elif attack_type == 'pitchfork':
+            usable = [payload_sets[i] if i < len(payload_sets) else [] for i in range(n)]
+            min_len = min((len(s) for s in usable), default=0)
+            for i in range(min_len):
+                vals = [usable[p][i] for p in range(n)]
+                jobs.append((vals, ', '.join(vals)))
+        elif attack_type == 'cluster_bomb':
+            usable = [payload_sets[i] if (i < len(payload_sets) and payload_sets[i]) else [''] for i in range(n)]
+            for combo in itertools.product(*usable):
+                jobs.append((list(combo), ', '.join(combo)))
+        else:  # sniper (default): one position at a time, others keep default
+            for p in range(n):
+                for payload in set0:
+                    vals = list(defaults)
+                    vals[p] = payload
+                    jobs.append((vals, payload))
+        return jobs
+
+    def attack(self, raw_template, attack_type, payload_sets, scheme='https',
+               default_host='', timeout=30, follow_redirects=False, grep=None, on_result=None):
+        """Run an Intruder attack. Streams each result via on_result(result) if given."""
         self.results = []
         self.stop_flag = False
-        all_text = f"{template['url']}\n{json.dumps(template.get('headers', {}))}\n{template.get('body', '')}"
-        positions = self.find_positions(all_text)
-        
-        def send_request(req_data, payload, pos):
+
+        positions = self.find_positions(raw_template)
+        defaults = [p[2] for p in positions]
+        jobs = self._build_jobs(attack_type, defaults, payload_sets)
+
+        def do_job(req_num, vals, label):
+            if self.stop_flag:
+                return None
+            rendered = self.render(raw_template, vals) if positions else raw_template
+            parsed = parse_raw_http_request(rendered, scheme=scheme, default_host=default_host)
             start = time.time()
+            if not parsed or not parsed.get('method'):
+                return {'request': req_num, 'payload': label, 'status_code': 0, 'length': 0,
+                        'time': 0, 'grep': None, 'error': 'Invalid request', 'response': ''}
             try:
-                resp = self.session.request(
-                    method=req_data['method'].upper(),
-                    url=req_data['url'],
-                    headers=req_data.get('headers', {}),
-                    data=req_data.get('body') if req_data.get('body') else None,
-                    timeout=req_data.get('timeout', 30),
+                headers = {k: v for k, v in parsed['headers'].items() if k.lower() != 'content-length'}
+                resp = requests.request(
+                    method=parsed['method'].upper(),
+                    url=parsed['url'],
+                    headers=headers,
+                    data=parsed['body'].encode('utf-8', 'replace') if parsed['body'] else None,
+                    timeout=timeout,
+                    allow_redirects=follow_redirects,
                     verify=False
                 )
+                body = resp.text
+                raw_response = f"HTTP/1.1 {resp.status_code} {resp.reason}\r\n"
+                for hk, hv in resp.headers.items():
+                    raw_response += f"{hk}: {hv}\r\n"
+                raw_response += "\r\n" + body
                 return {
-                    'payload': payload, 'position': pos,
+                    'request': req_num, 'payload': label,
                     'status_code': resp.status_code,
                     'length': len(resp.content),
                     'time': round(time.time() - start, 3),
-                    'error': None
+                    'grep': (body.count(grep) if grep else None),
+                    'error': None,
+                    'response': raw_response[:200000]  # cap stored response
                 }
             except Exception as e:
-                return {'payload': payload, 'position': pos, 'status_code': 0, 'length': 0, 'time': time.time() - start, 'error': str(e)}
-        
+                return {'request': req_num, 'payload': label, 'status_code': 0, 'length': 0,
+                        'time': round(time.time() - start, 3), 'grep': None, 'error': str(e), 'response': ''}
+
         with ThreadPoolExecutor(max_workers=self.threads) as exe:
             futures = []
-            if positions:
-                for pos_idx in range(len(positions)):
-                    for payload in payloads:
-                        if self.stop_flag:
-                            break
-                        new_url = self.replace_position(template['url'], pos_idx, payload)
-                        new_headers = {k: self.replace_position(v, pos_idx, payload) for k, v in template.get('headers', {}).items()}
-                        new_body = self.replace_position(template.get('body', ''), pos_idx, payload)
-                        req = {'method': template['method'], 'url': new_url, 'headers': new_headers, 'body': new_body, 'timeout': template.get('timeout', 30)}
-                        futures.append(exe.submit(send_request, req, payload, pos_idx))
-            else:
-                for payload in payloads:
-                    if self.stop_flag:
-                        break
-                    futures.append(exe.submit(send_request, template, payload, 0))
-            
-            for f in futures:
-                if not self.stop_flag:
-                    self.results.append(f.result())
-        
-        return self.results
-    
-    def attack_battering_ram(self, template, payloads):
-        self.results = []
-        self.stop_flag = False
-        
-        def send_request(req_data, payload):
-            start = time.time()
-            try:
-                resp = self.session.request(
-                    method=req_data['method'].upper(),
-                    url=req_data['url'],
-                    headers=req_data.get('headers', {}),
-                    data=req_data.get('body') if req_data.get('body') else None,
-                    timeout=req_data.get('timeout', 30),
-                    verify=False
-                )
-                return {'payload': payload, 'position': -1, 'status_code': resp.status_code, 'length': len(resp.content), 'time': round(time.time() - start, 3), 'error': None}
-            except Exception as e:
-                return {'payload': payload, 'position': -1, 'status_code': 0, 'length': 0, 'time': time.time() - start, 'error': str(e)}
-        
-        with ThreadPoolExecutor(max_workers=self.threads) as exe:
-            futures = []
-            for payload in payloads:
+            for i, (vals, label) in enumerate(jobs):
                 if self.stop_flag:
                     break
-                new_url = self.replace_all_positions(template['url'], payload)
-                new_headers = {k: self.replace_all_positions(v, payload) for k, v in template.get('headers', {}).items()}
-                new_body = self.replace_all_positions(template.get('body', ''), payload)
-                req = {'method': template['method'], 'url': new_url, 'headers': new_headers, 'body': new_body, 'timeout': template.get('timeout', 30)}
-                futures.append(exe.submit(send_request, req, payload))
-            
+                futures.append(exe.submit(do_job, i + 1, vals, label))
+
             for f in futures:
-                if not self.stop_flag:
-                    self.results.append(f.result())
-        
+                if self.stop_flag:
+                    break
+                r = f.result()
+                if r is not None:
+                    self.results.append(r)
+                    if on_result:
+                        try:
+                            on_result(r)
+                        except Exception:
+                            pass
+
         return self.results
-    
+
     def stop(self):
         self.stop_flag = True
 
@@ -730,6 +931,30 @@ def save_to_history(method, url, status_code, req_headers, req_body, resp_header
         conn.close()
     except Exception as e:
         print(f"Error saving to history: {e}")
+
+def get_max_history_id():
+    """Return the highest history id currently stored (0 if empty)."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT MAX(id) FROM history")
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row and row[0] is not None else 0
+    except Exception:
+        return 0
+
+def get_history_after(after_id):
+    """Return history rows newer than after_id (oldest first) for live updates."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id, method, url, status_code, time FROM history WHERE id > ? ORDER BY id ASC", (after_id,))
+        rows = c.fetchall()
+        conn.close()
+        return rows
+    except Exception:
+        return []
 
 # Track notified requests in memory to avoid duplicates within the same session
 notified_requests = set()
@@ -792,10 +1017,33 @@ async def poll_intercepts():
         except Exception as e:
             print(f"Error in poll_intercepts: {e}")
 
+# Background task to broadcast new history rows in real time
+async def poll_history():
+    """Watch the history table and push newly logged entries to all clients.
+
+    The proxy addon (mitmdump process) writes history to SQLite; this task runs
+    in the FastAPI process and bridges those rows to connected WebSocket clients.
+    """
+    global last_history_id
+    last_history_id = get_max_history_id()
+    while True:
+        try:
+            await asyncio.sleep(0.5)
+            new_rows = get_history_after(last_history_id)
+            for row in new_rows:
+                last_history_id = row[0]
+                await manager.broadcast({'type': 'history_new', 'row': list(row)})
+        except Exception as e:
+            print(f"Error in poll_history: {e}")
+
+# Highest history id already broadcast to clients
+last_history_id = 0
+
 # Start background task
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(poll_intercepts())
+    asyncio.create_task(poll_history())
 
 # Main WebSocket endpoint
 @app.websocket("/ws")
@@ -906,7 +1154,30 @@ async def websocket_endpoint(websocket: WebSocket):
                 for req_id in ids:
                     update_intercept_status(req_id, 'drop')
                 await manager.send_personal_message({'type': 'queue_cleared'}, websocket)
-            
+
+            # SCOPE ACTIONS (target-scope rules + extension excludes)
+            elif action == 'get_scope':
+                await manager.send_personal_message({'type': 'scope', **get_full_scope()}, websocket)
+
+            elif action == 'toggle_scope':
+                set_scope_enabled(data.get('enabled', False))
+                await manager.broadcast({'type': 'scope', **get_full_scope()})
+
+            elif action == 'toggle_extension_exclude':
+                set_extension_exclude_enabled(data.get('enabled', False))
+                await manager.broadcast({'type': 'scope', **get_full_scope()})
+
+            elif action == 'add_scope_rule':
+                rule_type = data.get('rule_type')
+                pattern = (data.get('pattern') or '').strip()
+                if rule_type in ('include', 'exclude', 'extension') and pattern:
+                    add_scope_rule(rule_type, pattern)
+                await manager.broadcast({'type': 'scope', **get_full_scope()})
+
+            elif action == 'remove_scope_rule':
+                remove_scope_rule(data.get('id'))
+                await manager.broadcast({'type': 'scope', **get_full_scope()})
+
             # HISTORY ACTIONS
             elif action == 'get_history':
                 conn = sqlite3.connect(DB_FILE)
@@ -940,69 +1211,163 @@ async def websocket_endpoint(websocket: WebSocket):
                 conn.close()
                 await manager.send_personal_message({'type': 'history_cleared'}, websocket)
             
-            # REPEATER ACTIONS
+            # REPEATER ACTIONS (Burp-style: edit a raw HTTP request, get a raw response)
             elif action == 'repeater_send':
-                req_data = data.get('request', {})
+                raw = data.get('raw', '')
+                target = (data.get('target') or '').strip()
+                follow_redirects = data.get('follow_redirects', False)
+                timeout = data.get('timeout', 30)
+                # Optional client tab/request id, echoed back so the UI can route
+                # the response to the Repeater tab that sent it.
+                req_id = data.get('req_id')
+
+                # An optional target override decides scheme/host when the request
+                # line only carries a path (the standard on-the-wire form).
+                scheme = 'https'
+                default_host = ''
+                if target:
+                    from urllib.parse import urlparse
+                    if '://' not in target:
+                        target = 'https://' + target
+                    parsed_target = urlparse(target)
+                    scheme = parsed_target.scheme or 'https'
+                    default_host = parsed_target.netloc
+
+                parsed = parse_raw_http_request(raw, scheme=scheme, default_host=default_host)
                 start = time.time()
-                try:
-                    resp = requests.request(
-                        method=req_data.get('method', 'GET').upper(),
-                        url=req_data.get('url', ''),
-                        headers=req_data.get('headers', {}),
-                        data=req_data.get('body') if req_data.get('body') else None,
-                        timeout=req_data.get('timeout', 30),
-                        allow_redirects=req_data.get('follow_redirects', True),
-                        verify=False
-                    )
+
+                if not parsed or not parsed.get('method'):
                     await manager.send_personal_message({
                         'type': 'repeater_response',
-                        'success': True,
-                        'data': {
-                            'status_code': resp.status_code,
-                            'headers': dict(resp.headers),
-                            'body': resp.text,
-                            'elapsed_time': round(time.time() - start, 3),
-                            'size': len(resp.content)
-                        }
-                    }, websocket)
-                except Exception as e:
-                    await manager.send_personal_message({
-                        'type': 'repeater_response',
+                        'req_id': req_id,
                         'success': False,
-                        'error': str(e)
+                        'error': 'Could not parse raw HTTP request'
                     }, websocket)
+                else:
+                    # Drop Content-Length so requests recomputes it for any edited body.
+                    req_headers = {k: v for k, v in parsed['headers'].items()
+                                   if k.lower() != 'content-length'}
+                    try:
+                        resp = requests.request(
+                            method=parsed['method'].upper(),
+                            url=parsed['url'],
+                            headers=req_headers,
+                            data=parsed['body'].encode('utf-8', 'replace') if parsed['body'] else None,
+                            timeout=timeout,
+                            allow_redirects=follow_redirects,
+                            verify=False
+                        )
+
+                        # Build the raw HTTP response (status line + headers + body)
+                        raw_response = f"HTTP/1.1 {resp.status_code} {resp.reason}\r\n"
+                        for hk, hv in resp.headers.items():
+                            raw_response += f"{capitalize_header_name(hk)}: {hv}\r\n"
+                        raw_response += "\r\n" + resp.text
+
+                        await manager.send_personal_message({
+                            'type': 'repeater_response',
+                            'success': True,
+                            'data': {
+                                'status_code': resp.status_code,
+                                'reason': resp.reason,
+                                'url': parsed['url'],
+                                'raw_response': raw_response,
+                                'headers': dict(resp.headers),
+                                'body': resp.text,
+                                'elapsed_time': round(time.time() - start, 3),
+                                'size': len(resp.content)
+                            }
+                        }, websocket)
+                    except Exception as e:
+                        await manager.send_personal_message({
+                            'type': 'repeater_response',
+                            'success': False,
+                            'error': str(e)
+                        }, websocket)
             
-            # INTRUDER ACTIONS
+            # INTRUDER ACTIONS (Burp-style: raw request template with § positions)
             elif action == 'intruder_attack':
                 global intruder_instance
                 intruder_instance = Intruder(threads=data.get('threads', 10))
-                template = {
-                    'method': data.get('method', 'GET'),
-                    'url': data.get('url', ''),
-                    'headers': data.get('headers', {}),
-                    'body': data.get('body', ''),
-                    'timeout': data.get('timeout', 30)
-                }
+
+                raw_template = data.get('raw', '')
+                target = (data.get('target') or '').strip()
                 attack_type = data.get('attack_type', 'sniper')
-                payloads = data.get('payloads', [])
-                
-                if attack_type == 'sniper':
-                    results = intruder_instance.attack_sniper(template, payloads)
-                elif attack_type == 'battering_ram':
-                    results = intruder_instance.attack_battering_ram(template, payloads)
+                # payload_sets: one list per position. Fall back to a single legacy set.
+                payload_sets = data.get('payload_sets')
+                if payload_sets is None:
+                    payload_sets = [data.get('payloads', [])]
+                grep = data.get('grep') or None
+                timeout = data.get('timeout', 30)
+                follow_redirects = data.get('follow_redirects', False)
+
+                # Resolve scheme/host from an optional target override.
+                scheme = 'https'
+                default_host = ''
+                if target:
+                    from urllib.parse import urlparse
+                    if '://' not in target:
+                        target = 'https://' + target
+                    pt = urlparse(target)
+                    scheme = pt.scheme or 'https'
+                    default_host = pt.netloc
+
+                # Stream each completed result back to this client as it finishes.
+                loop = asyncio.get_running_loop()
+
+                def on_result(r):
+                    light = {k: r.get(k) for k in
+                             ('request', 'payload', 'status_code', 'length', 'time', 'grep', 'error')}
+                    asyncio.run_coroutine_threadsafe(
+                        manager.send_personal_message({'type': 'intruder_result', 'result': light}, websocket),
+                        loop
+                    )
+
+                await manager.send_personal_message({'type': 'intruder_started'}, websocket)
+
+                # Run the attack as a background task so the receive loop keeps
+                # processing messages (e.g. intruder_stop) while it runs.
+                attack_engine = intruder_instance
+
+                async def run_attack():
+                    results = await loop.run_in_executor(None, lambda: attack_engine.attack(
+                        raw_template, attack_type, payload_sets,
+                        scheme=scheme, default_host=default_host,
+                        timeout=timeout, follow_redirects=follow_redirects,
+                        grep=grep, on_result=on_result
+                    ))
+                    errors = sum(1 for r in results if r.get('error'))
+                    await manager.send_personal_message({
+                        'type': 'intruder_complete',
+                        'total': len(results),
+                        'errors': errors,
+                        'stopped': attack_engine.stop_flag
+                    }, websocket)
+
+                asyncio.create_task(run_attack())
+
+            elif action == 'intruder_get_response':
+                idx = data.get('index')
+                found = next((r for r in intruder_instance.results if r.get('request') == idx), None)
+                if found:
+                    await manager.send_personal_message({
+                        'type': 'intruder_response',
+                        'index': idx,
+                        'payload': found.get('payload'),
+                        'status_code': found.get('status_code'),
+                        'response': found.get('response', '')
+                    }, websocket)
                 else:
-                    results = intruder_instance.attack_sniper(template, payloads)
-                
-                await manager.send_personal_message({
-                    'type': 'intruder_results',
-                    'total': len(results),
-                    'results': results
-                }, websocket)
-            
+                    await manager.send_personal_message({
+                        'type': 'intruder_response',
+                        'index': idx,
+                        'response': '(response not available)'
+                    }, websocket)
+
             elif action == 'intruder_stop':
                 intruder_instance.stop()
                 await manager.send_personal_message({'type': 'intruder_stopped'}, websocket)
-            
+
             elif action == 'get_payloads':
                 payload_type = data.get('payload_type', 'passwords')
                 if payload_type == 'passwords':
@@ -1015,14 +1380,22 @@ async def websocket_endpoint(websocket: WebSocket):
                     payloads = PayloadGenerator.xss_payloads()
                 elif payload_type == 'path_traversal':
                     payloads = PayloadGenerator.path_traversal_payloads()
+                elif payload_type == 'directories':
+                    payloads = PayloadGenerator.directories()
+                elif payload_type == 'fuzz':
+                    payloads = PayloadGenerator.fuzz()
+                elif payload_type == 'http_methods':
+                    payloads = PayloadGenerator.http_methods()
                 elif payload_type == 'numbers':
                     payloads = PayloadGenerator.numbers(data.get('start', 0), data.get('end', 100), data.get('step', 1))
                 else:
                     payloads = []
-                
+
+                # Echo the requesting set index so multi-set UIs know where to put it.
                 await manager.send_personal_message({
                     'type': 'payloads',
                     'payload_type': payload_type,
+                    'set_index': data.get('set_index', 0),
                     'payloads': payloads
                 }, websocket)
             
@@ -1074,7 +1447,13 @@ if MITMPROXY_AVAILABLE:
                 if re.search(pattern, flow.request.path):
                     return False
             return True
-        
+
+        def _processable(self, flow):
+            """True if this flow passes the infra excludes AND the user's scope rules."""
+            if not self.should_intercept(flow):
+                return False
+            return is_flow_in_scope(flow.request.url, flow.request.path)
+
         def _process_intercepted_flows(self):
             """Background thread that processes intercepted flows"""
             while not self.stop_processing:
@@ -1169,10 +1548,14 @@ if MITMPROXY_AVAILABLE:
                     time.sleep(0.5)
         
         def request(self, flow):
+            # Scope/extension rules gate everything (interception AND logging).
+            if not self._processable(flow):
+                return
+
             # Check if intercept is enabled via database (IPC)
-            if not is_intercept_enabled() or not self.should_intercept(flow):
+            if not is_intercept_enabled():
                 # Still track the flow for potential response interception
-                if is_response_intercept_enabled() and self.should_intercept(flow):
+                if is_response_intercept_enabled():
                     req_id = str(uuid.uuid4())
                     self.flow_request_ids[flow] = req_id
                 return
@@ -1212,6 +1595,10 @@ if MITMPROXY_AVAILABLE:
             flow.intercept()  # This pauses the flow without blocking mitmproxy
         
         def response(self, flow):
+            # Out-of-scope flows are neither intercepted nor logged to history.
+            if not self._processable(flow):
+                return
+
             # Try to find the request ID by matching URL and method
             req_id = None
             url_method_key = f"{flow.request.method}:{flow.request.url}"

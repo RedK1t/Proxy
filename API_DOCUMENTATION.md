@@ -420,6 +420,276 @@ The proxy saves all requests/responses that pass through it. You can view them l
 
 ---
 
+### 4. Real-Time History Updates (push)
+
+**Purpose:** The backend pushes each newly logged request/response to all connected
+clients as it happens — no polling or re-opening the tab required.
+
+**Receive from Backend (unsolicited):**
+```javascript
+{
+    "type": "history_new",
+    "row": [42, "GET", "https://example.com/api", 200, "2026-05-24 10:31:00"]
+}
+```
+
+**`row` format:** `[id, method, url, status_code, timestamp]` — the same shape as one
+entry in the `history` message's `data` array. Prepend it to your list (newest first).
+
+---
+
+## REPEATER FEATURE (Burp-style)
+
+The Repeater lets you edit a **raw HTTP request** and resend it, viewing the **raw HTTP
+response**. The UI supports multiple independent tabs; each tab tags its request with a
+client-generated `req_id` so the matching response is routed back to it.
+
+### Send a Request
+
+**Send to Backend:**
+```javascript
+{
+    "action": "repeater_send",
+    "req_id": "rq_1716542400_ab12c",   // optional; echoed back to match the tab
+    "raw": "GET /api/users HTTP/1.1\nHost: example.com\nUser-Agent: Mozilla/5.0\n\n",
+    "target": "https://example.com",    // optional; scheme/host override (else inferred from Host header)
+    "follow_redirects": false,
+    "timeout": 30
+}
+```
+
+**Notes:**
+- `raw` is a full raw HTTP request. The request line should use the path form
+  (`GET /api/users HTTP/1.1`); the destination is the `target` (if given) or the
+  `Host` header, defaulting to `https`.
+- `Content-Length` is recomputed automatically, so you can freely edit the body.
+
+**Receive from Backend (success):**
+```javascript
+{
+    "type": "repeater_response",
+    "req_id": "rq_1716542400_ab12c",
+    "success": true,
+    "data": {
+        "status_code": 200,
+        "reason": "OK",
+        "url": "https://example.com/api/users",
+        "raw_response": "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{...}",
+        "headers": { "Content-Type": "application/json" },
+        "body": "{...}",
+        "elapsed_time": 0.184,
+        "size": 1024
+    }
+}
+```
+
+**Receive from Backend (error):**
+```javascript
+{
+    "type": "repeater_response",
+    "req_id": "rq_1716542400_ab12c",
+    "success": false,
+    "error": "Connection refused"
+}
+```
+
+---
+
+## INTRUDER FEATURE (Burp-style)
+
+The Intruder fuzzes a **raw HTTP request template** in which payload positions are marked
+with the `§` character (e.g. `GET /user/§1§ HTTP/1.1`). Results stream back one row at a
+time, and full responses can be fetched on demand.
+
+### Attack Types
+| Type | Payload sets | Behaviour |
+|------|--------------|-----------|
+| `sniper` | 1 | One position at a time; others keep their default (text between the markers) |
+| `battering_ram` | 1 | Same payload placed in every position |
+| `pitchfork` | 1 per position | Sets advance in parallel (stops at the shortest) |
+| `cluster_bomb` | 1 per position | Every combination across the sets |
+
+### Start an Attack
+
+**Send to Backend:**
+```javascript
+{
+    "action": "intruder_attack",
+    "raw": "POST /login HTTP/1.1\nHost: example.com\nContent-Type: application/x-www-form-urlencoded\n\nuser=§admin§&pass=§x§",
+    "target": "https://example.com",          // optional
+    "attack_type": "cluster_bomb",
+    "payload_sets": [["admin", "root"], ["123456", "password"]],  // one list per position
+    "grep": "Welcome",                          // optional: counts substring matches per response
+    "threads": 10,
+    "timeout": 30,
+    "follow_redirects": false
+}
+```
+
+**Receive from Backend:**
+```javascript
+// 1) Acknowledgement
+{ "type": "intruder_started" }
+
+// 2) One message per completed request (streamed)
+{
+    "type": "intruder_result",
+    "result": {
+        "request": 1,            // request number (use to fetch the full response)
+        "payload": "admin, 123456",
+        "status_code": 200,
+        "length": 1024,
+        "time": 0.153,
+        "grep": 1,               // substring match count, or null if no grep
+        "error": null
+    }
+}
+
+// 3) Completion summary
+{
+    "type": "intruder_complete",
+    "total": 4,
+    "errors": 0,
+    "stopped": false             // true if the user stopped it early
+}
+```
+
+### Fetch a Full Response
+
+**Purpose:** Responses are kept server-side; request one when a result row is clicked.
+
+**Send to Backend:**
+```javascript
+{
+    "action": "intruder_get_response",
+    "index": 1                   // the result's "request" number
+}
+```
+
+**Receive from Backend:**
+```javascript
+{
+    "type": "intruder_response",
+    "index": 1,
+    "payload": "admin, 123456",
+    "status_code": 200,
+    "response": "HTTP/1.1 200 OK\r\n...\r\n\r\n<body>"
+}
+```
+
+### Stop an Attack
+
+**Send to Backend:**
+```javascript
+{ "action": "intruder_stop" }
+```
+
+**Receive from Backend:**
+```javascript
+{ "type": "intruder_stopped" }
+```
+An `intruder_complete` message with `"stopped": true` follows once the in-flight
+requests finish.
+
+### Load Payload Presets
+
+**Send to Backend:**
+```javascript
+{
+    "action": "get_payloads",
+    "payload_type": "passwords",   // passwords | usernames | sqli | xss | path_traversal | directories | fuzz | http_methods | numbers
+    "set_index": 0,                // which payload set the result is for (echoed back)
+    "start": 0, "end": 100, "step": 1   // only for "numbers"
+}
+```
+
+**Receive from Backend:**
+```javascript
+{
+    "type": "payloads",
+    "payload_type": "passwords",
+    "set_index": 0,
+    "payloads": ["123456", "password", "..."]
+}
+```
+
+---
+
+## SCOPE FEATURE
+
+Scope decides which traffic the proxy actually **intercepts and logs**. It has two
+independent parts, each with its own on/off toggle:
+
+1. **Target Scope** — `include` / `exclude` URL rules. Each rule is tried as a **RegEx**
+   first; if it isn't valid regex it falls back to **glob wildcards** (`*`). When Target
+   Scope is ON: a request must match at least one `include` rule (an empty include list
+   means "everything") and must not match any `exclude` rule.
+2. **Extension Exclude** — a list of file extensions (e.g. `js`, `css`, `png`). When ON,
+   any request whose path ends in one of these extensions is skipped. A default set is
+   seeded on first run and can be edited.
+
+Out-of-scope flows are **neither intercepted nor written to HTTP History**.
+
+### 1. Get Scope
+
+**Send to Backend:**
+```javascript
+{ "action": "get_scope" }
+```
+
+**Receive from Backend:**
+```javascript
+{
+    "type": "scope",
+    "enabled": false,            // Target Scope toggle
+    "extension_enabled": true,   // Extension Exclude toggle
+    "include":    [ { "id": 1, "pattern": ".*fawry\\.com" } ],
+    "exclude":    [ { "id": 2, "pattern": ".*google\\.com" } ],
+    "extensions": [ { "id": 3, "pattern": "js" }, { "id": 4, "pattern": "css" } ]
+}
+```
+The same `scope` message is **broadcast to all clients** whenever scope changes, so every
+open dashboard stays in sync.
+
+### 2. Toggle Target Scope
+
+**Send to Backend:**
+```javascript
+{ "action": "toggle_scope", "enabled": true }
+```
+**Receive:** a fresh `scope` message (broadcast).
+
+### 3. Toggle Extension Exclude
+
+**Send to Backend:**
+```javascript
+{ "action": "toggle_extension_exclude", "enabled": true }
+```
+**Receive:** a fresh `scope` message (broadcast).
+
+### 4. Add a Scope Rule
+
+**Send to Backend:**
+```javascript
+{
+    "action": "add_scope_rule",
+    "rule_type": "include",      // "include" | "exclude" | "extension"
+    "pattern": ".*paypal\\.com"  // for "extension", just the extension e.g. "woff2"
+}
+```
+**Receive:** a fresh `scope` message (broadcast). Duplicate (rule_type, pattern) pairs are
+ignored.
+
+### 5. Remove a Scope Rule
+
+**Send to Backend:**
+```javascript
+{ "action": "remove_scope_rule", "id": 2 }
+```
+**Receive:** a fresh `scope` message (broadcast).
+
+---
+
 ## COMPLETE WORKFLOW EXAMPLES
 
 ### Example 1: Basic Request Interception
@@ -614,4 +884,4 @@ Always check for `type: 'error'` in your message handler!
 
 ---
 
-That's it! You now have everything you need to build the frontend for the RedKit Proxy interceptor and history features.
+That's it! You now have everything you need to build the frontend for the RedKit Proxy: Interceptor, HTTP History (with real-time updates), Repeater, Intruder, and Scope.

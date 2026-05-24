@@ -5,7 +5,7 @@ __pycache__/
 # Local DB and logs
 proxy_history.db
 proxy_traffic.log
-
+proxy_history.db*
 # Editor / OS files
 .vscode/
 .DS_Store
