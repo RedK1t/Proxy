@@ -932,6 +932,54 @@ def save_to_history(method, url, status_code, req_headers, req_body, resp_header
     except Exception as e:
         print(f"Error saving to history: {e}")
 
+def format_history_row(row):
+    """
+    Format a database history row into the frontend Table schema:
+    {
+      id: string,
+      Time: string,
+      Type: string,
+      Method: string,
+      Direction: string,
+      Host: string,
+      URL: string,
+      StatusCode: number,
+      Length: number,
+      Params: boolean
+    }
+    """
+    h_id, method, url, status_code, time_str, req_headers, req_body, resp_headers, resp_body = row
+    
+    # Extract host and type
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        host = parsed.netloc
+        h_type = parsed.scheme.upper()
+        params = bool(parsed.query)
+    except:
+        host = "unknown"
+        h_type = "HTTP"
+        params = False
+
+    # Calculate total length (headers + body)
+    # Note: req_headers and resp_headers are stored as JSON strings in history table
+    # We sum the lengths of the actual content
+    total_length = len(req_headers or "") + len(req_body or "") + len(resp_headers or "") + len(resp_body or "")
+
+    return {
+        "id": str(h_id),
+        "Time": time_str,
+        "Type": h_type,
+        "Method": method,
+        "Direction": "History",
+        "Host": host,
+        "URL": url,
+        "StatusCode": status_code,
+        "Length": total_length,
+        "Params": params
+    }
+
 def get_max_history_id():
     """Return the highest history id currently stored (0 if empty)."""
     try:
@@ -949,7 +997,7 @@ def get_history_after(after_id):
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT id, method, url, status_code, time FROM history WHERE id > ? ORDER BY id ASC", (after_id,))
+        c.execute("SELECT id, method, url, status_code, time, request_headers, request_body, response_headers, response_body FROM history WHERE id > ? ORDER BY id ASC", (after_id,))
         rows = c.fetchall()
         conn.close()
         return rows
@@ -1032,7 +1080,8 @@ async def poll_history():
             new_rows = get_history_after(last_history_id)
             for row in new_rows:
                 last_history_id = row[0]
-                await manager.broadcast({'type': 'history_new', 'row': list(row)})
+                formatted_row = format_history_row(row)
+                await manager.broadcast({'type': 'history_new', 'row': formatted_row})
         except Exception as e:
             print(f"Error in poll_history: {e}")
 
@@ -1182,10 +1231,11 @@ async def websocket_endpoint(websocket: WebSocket):
             elif action == 'get_history':
                 conn = sqlite3.connect(DB_FILE)
                 c = conn.cursor()
-                c.execute("SELECT id, method, url, status_code, time FROM history ORDER BY id DESC LIMIT 100")
+                c.execute("SELECT id, method, url, status_code, time, request_headers, request_body, response_headers, response_body FROM history ORDER BY id DESC LIMIT 100")
                 rows = c.fetchall()
                 conn.close()
-                await manager.send_personal_message({'type': 'history', 'data': rows}, websocket)
+                formatted_data = [format_history_row(row) for row in rows]
+                await manager.send_personal_message({'type': 'history', 'data': formatted_data}, websocket)
             
             elif action == 'get_history_detail':
                 req_id = data.get('id')
