@@ -849,11 +849,13 @@ class Intruder:
                     'time': round(time.time() - start, 3),
                     'grep': (body.count(grep) if grep else None),
                     'error': None,
+                    'request_raw': rendered,
                     'response': raw_response[:200000]  # cap stored response
                 }
             except Exception as e:
                 return {'request': req_num, 'payload': label, 'status_code': 0, 'length': 0,
-                        'time': round(time.time() - start, 3), 'grep': None, 'error': str(e), 'response': ''}
+                        'time': round(time.time() - start, 3), 'grep': None, 'error': str(e),
+                        'request_raw': rendered, 'response': ''}
 
         with ThreadPoolExecutor(max_workers=self.threads) as exe:
             futures = []
@@ -1405,6 +1407,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         'index': idx,
                         'payload': found.get('payload'),
                         'status_code': found.get('status_code'),
+                        'request': found.get('request_raw', ''),
                         'response': found.get('response', '')
                     }, websocket)
                 else:
