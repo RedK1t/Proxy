@@ -1318,6 +1318,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                         await manager.send_personal_message({
                             'type': 'repeater_response',
+                            'req_id': req_id,
                             'success': True,
                             'data': {
                                 'status_code': resp.status_code,
@@ -1333,6 +1334,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     except Exception as e:
                         await manager.send_personal_message({
                             'type': 'repeater_response',
+                            'req_id': req_id,
                             'success': False,
                             'error': str(e)
                         }, websocket)
