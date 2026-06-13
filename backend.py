@@ -32,6 +32,24 @@ except ImportError:
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+
+def direct_request(**kwargs):
+    """Send an HTTP request that bypasses the interception proxy entirely.
+
+    The Repeater and Intruder are stand-alone tools: their traffic must NOT be
+    captured or held by the mitmproxy interceptor. `trust_env=False` makes
+    requests ignore any HTTP_PROXY/HTTPS_PROXY/NO_PROXY env vars, so the request
+    always goes straight to the target regardless of how the browser is proxied
+    or whether interception is currently ON.
+    """
+    session = requests.Session()
+    session.trust_env = False
+    try:
+        return session.request(**kwargs)
+    finally:
+        session.close()
+
+
 # Database
 DB_FILE = "proxy_history.db"
 
@@ -50,9 +68,18 @@ def init_database():
             request_body TEXT,
             response_headers TEXT,
             response_body TEXT,
-            time TEXT
+            time TEXT,
+            total_length INTEGER DEFAULT 0
         )
     """)
+
+    # Migration: add total_length to pre-existing history tables (reused containers).
+    # Lets the history LIST be served without loading the (large) body columns.
+    try:
+        c.execute("SELECT total_length FROM history LIMIT 1")
+    except sqlite3.OperationalError:
+        c.execute("ALTER TABLE history ADD COLUMN total_length INTEGER DEFAULT 0")
+        print("[DB Migration] Added 'total_length' column to history table")
     
     # Intercept queue table for IPC
     c.execute("""
@@ -828,7 +855,7 @@ class Intruder:
                         'time': 0, 'grep': None, 'error': 'Invalid request', 'response': ''}
             try:
                 headers = {k: v for k, v in parsed['headers'].items() if k.lower() != 'content-length'}
-                resp = requests.request(
+                resp = direct_request(
                     method=parsed['method'].upper(),
                     url=parsed['url'],
                     headers=headers,
@@ -925,10 +952,15 @@ manager = ConnectionManager()
 # Database helpers
 def save_to_history(method, url, status_code, req_headers, req_body, resp_headers, resp_body):
     try:
+        # Pre-compute the size now so the history LIST query never has to load bodies.
+        total_length = (
+            len(req_headers or "") + len(req_body or "")
+            + len(resp_headers or "") + len(resp_body or "")
+        )
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("INSERT INTO history (method, url, status_code, request_headers, request_body, response_headers, response_body, time) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                 (method, url, status_code, req_headers, req_body, resp_headers, resp_body, str(datetime.datetime.now())))
+        c.execute("INSERT INTO history (method, url, status_code, request_headers, request_body, response_headers, response_body, time, total_length) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (method, url, status_code, req_headers, req_body, resp_headers, resp_body, str(datetime.datetime.now()), total_length))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -950,8 +982,9 @@ def format_history_row(row):
       Params: boolean
     }
     """
-    h_id, method, url, status_code, time_str, req_headers, req_body, resp_headers, resp_body = row
-    
+    # Lightweight row: id, method, url, status_code, time, total_length (NO bodies).
+    h_id, method, url, status_code, time_str, total_length = row
+
     # Extract host and type
     try:
         from urllib.parse import urlparse
@@ -964,10 +997,7 @@ def format_history_row(row):
         h_type = "HTTP"
         params = False
 
-    # Calculate total length (headers + body)
-    # Note: req_headers and resp_headers are stored as JSON strings in history table
-    # We sum the lengths of the actual content
-    total_length = len(req_headers or "") + len(req_body or "") + len(resp_headers or "") + len(resp_body or "")
+    total_length = total_length or 0
 
     return {
         "id": str(h_id),
@@ -995,11 +1025,12 @@ def get_max_history_id():
         return 0
 
 def get_history_after(after_id):
-    """Return history rows newer than after_id (oldest first) for live updates."""
+    """Return lightweight history rows newer than after_id (oldest first) for live
+    updates. Bodies are intentionally NOT loaded; a LIMIT caps catch-up bursts."""
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT id, method, url, status_code, time, request_headers, request_body, response_headers, response_body FROM history WHERE id > ? ORDER BY id ASC", (after_id,))
+        c.execute("SELECT id, method, url, status_code, time, total_length FROM history WHERE id > ? ORDER BY id ASC LIMIT 200", (after_id,))
         rows = c.fetchall()
         conn.close()
         return rows
@@ -1233,7 +1264,9 @@ async def websocket_endpoint(websocket: WebSocket):
             elif action == 'get_history':
                 conn = sqlite3.connect(DB_FILE)
                 c = conn.cursor()
-                c.execute("SELECT id, method, url, status_code, time, request_headers, request_body, response_headers, response_body FROM history ORDER BY id DESC LIMIT 100")
+                # Lightweight list: no body columns loaded — full req/resp is fetched
+                # per row on click via get_history_detail.
+                c.execute("SELECT id, method, url, status_code, time, total_length FROM history ORDER BY id DESC LIMIT 100")
                 rows = c.fetchall()
                 conn.close()
                 formatted_data = [format_history_row(row) for row in rows]
@@ -1300,7 +1333,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     req_headers = {k: v for k, v in parsed['headers'].items()
                                    if k.lower() != 'content-length'}
                     try:
-                        resp = requests.request(
+                        resp = direct_request(
                             method=parsed['method'].upper(),
                             url=parsed['url'],
                             headers=req_headers,
