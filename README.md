@@ -1,4 +1,17 @@
-# RedKit Proxy
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/RedK1t/RedKit/main/docs/assets/logo-light.svg">
+    <img src="https://raw.githubusercontent.com/RedK1t/RedKit/main/docs/assets/logo-dark.svg" alt="RedKit" width="96">
+  </picture>
+</p>
+
+<h1 align="center">RedKit Proxy</h1>
+
+<p align="center">mitmproxy-based interceptor with HTTP history, Repeater and Intruder.<br>
+Part of <a href="https://github.com/RedK1t/RedKit"><b>RedKit</b></a>, a modular, web-based penetration-testing framework.</p>
+
+---
+
 
 Lightweight mitmproxy-based proxy addons + FastAPI dashboard with **Repeater** and **Intruder** tools (Burp Suite style).
 
